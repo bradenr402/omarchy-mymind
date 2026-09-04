@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "braden.mymind",
+  "name": "mymind",
+  "version": "0.1.0",
+  "author": "Braden",
+  "description": "Search your mymind, and save URLs, notes, clipboard contents and screenshots to it",
+  "kinds": ["overlay", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Overlay.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "mymind",
+    "description": "Opens the mymind search overlay; right-click saves the clipboard",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "semantic": false
+    },
+    "schema": [
+      { "key": "semantic", "type": "boolean", "label": "Semantic search by default" }
+    ]
+  }
+}

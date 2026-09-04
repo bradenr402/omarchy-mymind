@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+"""mymind — a tiny stdlib-only client for the mymind API.
+
+Used by the Omarchy shell plugin (braden.mymind), but also usable directly:
+
+    mymind check
+    mymind search "design tools" [--semantic] [--limit 20]
+    mymind save-url https://example.com [--title T] [--tag t]... [--note MD] [--space ID]...
+    mymind save-note "# markdown" [--title T] [--tag t]... [--space ID]...
+    mymind save-file ./photo.png [--title T] [--tag t]... [--space ID]...
+    mymind save-clipboard [--tag t]... [--note MD]
+    mymind screenshot [--mode region|windows|fullscreen] [--tag t]...
+    mymind spaces
+    mymind add-tags <id> tag [tag...]
+    mymind add-note <id> "markdown"
+    mymind add-to-space <id> <spaceId>
+    mymind thumbnail <id> [--size 96x96]
+    mymind open <id>
+
+Every command prints a single JSON document on stdout. Errors print a JSON
+problem object on stdout AND a short message on stderr, and exit non-zero.
+
+Credentials: ~/.config/mymind/credentials.json  ({"kid": "...", "secret": "..."})
+Created by `mymind-setup`. Must be mode 0600.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import hmac
+import io
+import json
+import mimetypes
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+VERSION = "0.1.0"
+USER_AGENT = f"omarchy-mymind/{VERSION}"
+BASE_URL = os.environ.get("MYMIND_API_URL", "https://api.mymind.com")
+APP_URL = "https://access.mymind.com"
+
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+XDG_STATE = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+XDG_CACHE = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+
+CREDENTIALS_PATH = os.environ.get(
+    "MYMIND_CREDENTIALS", os.path.join(XDG_CONFIG, "mymind", "credentials.json")
+)
+STATE_DIR = os.path.join(XDG_STATE, "omarchy-mymind")
+BACKOFF_PATH = os.path.join(STATE_DIR, "backoff.json")
+CACHE_DIR = os.path.join(XDG_CACHE, "omarchy-mymind", "thumbnails")
+
+MAX_UPLOAD = 64 * 1024 * 1024
+URL_RE = re.compile(r"^(https?://)[^\s]+$", re.IGNORECASE)
+
+
+# --------------------------------------------------------------------------- #
+# Errors
+# --------------------------------------------------------------------------- #
+
+
+class MymindError(Exception):
+    """Carries an RFC 9457-ish problem object."""
+
+    def __init__(self, type_: str, detail: str, status: int = 0, extra: dict | None = None):
+        super().__init__(detail)
+        self.problem = {"type": type_, "status": status, "detail": detail}
+        if extra:
+            self.problem.update(extra)
+
+
+# --------------------------------------------------------------------------- #
+# Credentials & JWT
+# --------------------------------------------------------------------------- #
+
+
+def load_credentials() -> tuple[str, str]:
+    path = CREDENTIALS_PATH
+    if not os.path.exists(path):
+        raise MymindError(
+            "NotConfigured",
+            f"No credentials at {path}. Run `mymind-setup` to add your access key.",
+        )
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode & 0o077:
+        raise MymindError(
+            "InsecureCredentials",
+            f"{path} is readable by others (mode {oct(mode)}). Run: chmod 600 {path}",
+        )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        kid, secret = data["kid"], data["secret"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise MymindError("NotConfigured", f"Malformed credentials file: {exc}") from exc
+    if not kid or not secret:
+        raise MymindError("NotConfigured", "Credentials file is missing kid or secret.")
+    return kid, secret
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def decode_secret(secret: str) -> bytes:
+    # Base64 (standard or urlsafe), padding optional.
+    s = secret.strip().replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s)
+
+
+def sign_jwt(kid: str, secret: str, method: str, path: str) -> str:
+    now = int(time.time())
+    header = {"alg": "HS256", "typ": "JWT", "kid": kid}
+    claims = {"path": path, "method": method.upper(), "iat": now, "exp": now + 300}
+    segments = [
+        b64url(json.dumps(header, separators=(",", ":")).encode()),
+        b64url(json.dumps(claims, separators=(",", ":")).encode()),
+    ]
+    signing_input = ".".join(segments).encode("ascii")
+    sig = hmac.new(decode_secret(secret), signing_input, hashlib.sha256).digest()
+    segments.append(b64url(sig))
+    return ".".join(segments)
+
+
+# --------------------------------------------------------------------------- #
+# Rate limit back-off
+# --------------------------------------------------------------------------- #
+
+
+def _parse_ratelimit(header: str | None) -> dict[str, dict[str, int]]:
+    """Parse `"burst";r=9990;t=300, "sustained";r=99641;t=2589945`."""
+    out: dict[str, dict[str, int]] = {}
+    if not header:
+        return out
+    for item in header.split(","):
+        parts = [p.strip() for p in item.strip().split(";") if p.strip()]
+        if not parts:
+            continue
+        name = parts[0].strip('"')
+        params: dict[str, int] = {}
+        for p in parts[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                try:
+                    params[k.strip()] = int(v.strip())
+                except ValueError:
+                    pass
+        out[name] = params
+    return out
+
+
+def check_backoff() -> None:
+    try:
+        with open(BACKOFF_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        until = float(data.get("until", 0))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+    remaining = until - time.time()
+    if remaining > 0:
+        raise MymindError(
+            "RateLimited",
+            f"Rate limited; try again in {int(remaining) + 1}s.",
+            429,
+            {"retryAfter": int(remaining) + 1},
+        )
+
+
+def record_backoff(headers) -> int:
+    policies = _parse_ratelimit(headers.get("RateLimit"))
+    waits = [p.get("t", 0) for p in policies.values() if p.get("r", 1) == 0]
+    wait = max(waits) if waits else 60
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(BACKOFF_PATH, "w", encoding="utf-8") as fh:
+        json.dump({"until": time.time() + wait, "policies": policies}, fh)
+    return wait
+
+
+# --------------------------------------------------------------------------- #
+# HTTP
+# --------------------------------------------------------------------------- #
+
+
+class Response:
+    def __init__(self, status: int, headers, body: bytes):
+        self.status = status
+        self.headers = headers
+        self.body = body
+
+    def json(self):
+        if not self.body:
+            return {}
+        return json.loads(self.body.decode("utf-8"))
+
+
+def request(
+    method: str,
+    path: str,
+    *,
+    query: dict | list | None = None,
+    json_body=None,
+    raw_body: bytes | None = None,
+    content_type: str | None = None,
+    accept: str = "application/json",
+    follow_redirects: bool = True,
+    timeout: float = 30.0,
+) -> Response:
+    check_backoff()
+    kid, secret = load_credentials()
+
+    url = BASE_URL.rstrip("/") + path
+    if query:
+        if isinstance(query, dict):
+            query = [(k, v) for k, v in query.items() if v is not None]
+        url += "?" + urllib.parse.urlencode(query, doseq=True)
+
+    # JWT path claim is bound to the request path (without query string).
+    token = sign_jwt(kid, secret, method, path)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": USER_AGENT,
+        "Accept": accept,
+    }
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif raw_body is not None:
+        data = raw_body
+        headers["Content-Type"] = content_type or "application/octet-stream"
+
+    req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):  # noqa: D401
+            return None
+
+    opener = urllib.request.build_opener() if follow_redirects else urllib.request.build_opener(_NoRedirect)
+
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return Response(resp.status, resp.headers, resp.read())
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        if exc.code in (301, 302, 303, 307, 308):
+            return Response(exc.code, exc.headers, body)
+        if exc.code == 429:
+            wait = record_backoff(exc.headers)
+            raise MymindError(
+                "RateLimited", f"Rate limited; try again in {wait}s.", 429, {"retryAfter": wait}
+            ) from exc
+        try:
+            problem = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            problem = {}
+        raise MymindError(
+            problem.get("type") or f"Http{exc.code}",
+            problem.get("detail") or exc.reason or f"HTTP {exc.code}",
+            exc.code,
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise MymindError("Network", f"Network error: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise MymindError("Network", "Request timed out.") from exc
+
+
+def request_multipart(path: str, metadata: dict, blob: bytes, filename: str, mime: str) -> Response:
+    boundary = "----omarchy-mymind-" + uuid.uuid4().hex
+    buf = io.BytesIO()
+
+    def part(headers: str, payload: bytes):
+        buf.write(f"--{boundary}\r\n{headers}\r\n\r\n".encode("utf-8"))
+        buf.write(payload)
+        buf.write(b"\r\n")
+
+    part(
+        'Content-Disposition: form-data; name="metadata"\r\nContent-Type: application/json',
+        json.dumps(metadata).encode("utf-8"),
+    )
+    safe_name = filename.replace('"', "'").replace("\r", "").replace("\n", "")
+    part(
+        f'Content-Disposition: form-data; name="blob"; filename="{safe_name}"\r\nContent-Type: {mime}',
+        blob,
+    )
+    buf.write(f"--{boundary}--\r\n".encode("utf-8"))
+    return request(
+        "POST",
+        path,
+        raw_body=buf.getvalue(),
+        content_type=f"multipart/form-data; boundary={boundary}",
+        timeout=120,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Object helpers
+# --------------------------------------------------------------------------- #
+
+
+def _tags(names: list[str] | None) -> list[dict]:
+    return [{"name": n.strip().lstrip("#")} for n in (names or []) if n and n.strip()]
+
+
+def _spaces(ids: list[str] | None) -> list[dict]:
+    return [{"id": s.strip()} for s in (ids or []) if s and s.strip()]
+
+
+def _notes(markdown: str | None) -> list[dict]:
+    if not markdown or not markdown.strip():
+        return []
+    return [{"content": {"type": "text/markdown", "body": markdown}}]
+
+
+def _build_meta(args, **extra) -> dict:
+    meta: dict = {}
+    if getattr(args, "title", None):
+        meta["title"] = args.title
+    tags = _tags(getattr(args, "tag", None))
+    if tags:
+        meta["tags"] = tags
+    spaces = _spaces(getattr(args, "space", None))
+    if spaces:
+        meta["spaces"] = spaces
+    notes = _notes(getattr(args, "note", None))
+    if notes:
+        meta["notes"] = notes
+    meta.update(extra)
+    return meta
+
+
+def _save_result(resp: Response, kind: str, extra: dict | None = None) -> dict:
+    obj = resp.json()
+    out = {
+        "ok": True,
+        "kind": kind,
+        "status": resp.status,
+        "bumped": resp.status == 200,  # 200 => duplicate bumped, 201 => created
+        "id": obj.get("id"),
+        "title": obj.get("title"),
+        "url": (obj.get("source") or {}).get("url") or obj.get("url"),
+        "appUrl": app_url(obj.get("id")),
+        "cost": _int_header(resp.headers, "RateLimit-Cost"),
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
+def _int_header(headers, name: str) -> int | None:
+    v = headers.get(name)
+    try:
+        return int(v) if v is not None else None
+    except ValueError:
+        return None
+
+
+def app_url(object_id: str | None) -> str | None:
+    return f"{APP_URL}/everything/{object_id}" if object_id else None
+
+
+def summarize_object(obj: dict) -> dict:
+    """Trim an object to what the overlay needs."""
+    source = obj.get("source") or {}
+    url = source.get("url") or obj.get("url")
+    domain = ""
+    if url:
+        try:
+            domain = urllib.parse.urlsplit(url).netloc.removeprefix("www.")
+        except ValueError:
+            domain = ""
+    content = obj.get("content") or {}
+    body = content.get("body") if isinstance(content.get("body"), str) else ""
+    snippet = (obj.get("summary") or body or "").strip().replace("\n", " ")
+    if len(snippet) > 220:
+        snippet = snippet[:217].rstrip() + "…"
+    blob = obj.get("blob") or {}
+    return {
+        "id": obj.get("id"),
+        "title": obj.get("title") or (domain or "Untitled"),
+        "url": url,
+        "domain": domain,
+        "appUrl": app_url(obj.get("id")),
+        "snippet": snippet,
+        "tags": [t.get("name") for t in (obj.get("tags") or []) if t.get("name")],
+        "type": (obj.get("mainEntity") or {}).get("@type") or ("image" if str(blob.get("type", "")).startswith("image/") else ("note" if body and not url else "")),
+        "hasThumbnail": bool(blob or obj.get("screenshot")),
+        "created": obj.get("created"),
+        "bumped": obj.get("bumped"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+
+def cmd_check(args) -> dict:
+    resp = request("GET", "/objects", query={"limit": 1})
+    policy = _parse_ratelimit(resp.headers.get("RateLimit-Policy"))
+    state = _parse_ratelimit(resp.headers.get("RateLimit"))
+    return {"ok": True, "policy": policy, "remaining": state, "credentials": CREDENTIALS_PATH}
+
+
+def cmd_search(args) -> dict:
+    q = " ".join(args.query).strip()
+    if not q:
+        return {"ok": True, "query": "", "results": [], "cost": 0}
+    query = {"q": q, "limit": args.limit}
+    if args.semantic:
+        query["semantic"] = "true"
+    resp = request("GET", "/search", query=query)
+    matches = resp.json().get("matches") or []
+    cost = _int_header(resp.headers, "RateLimit-Cost") or 0
+    ids = [m["id"] for m in matches if m.get("id")]
+    results: list[dict] = []
+    if ids:
+        objs_resp = request("GET", "/objects", query=[("id", i) for i in ids])
+        cost += _int_header(objs_resp.headers, "RateLimit-Cost") or 0
+        by_id = {o.get("id"): o for o in objs_resp.json() if isinstance(o, dict)}
+        for m in matches:
+            o = by_id.get(m.get("id"))
+            if not o:
+                continue
+            s = summarize_object(o)
+            s["score"] = m.get("score")
+            results.append(s)
+    return {"ok": True, "query": q, "semantic": bool(args.semantic), "results": results, "cost": cost}
+
+
+def cmd_get(args) -> dict:
+    resp = request("GET", f"/objects/{args.id}")
+    return {"ok": True, "object": summarize_object(resp.json()), "raw": resp.json() if args.raw else None}
+
+
+def cmd_save_url(args) -> dict:
+    url = args.url.strip()
+    if not URL_RE.match(url):
+        raise MymindError("BadRequest", f"Not an http(s) URL: {url!r}", 400)
+    resp = request("POST", "/objects", json_body=_build_meta(args, url=url))
+    return _save_result(resp, "url")
+
+
+def cmd_save_note(args) -> dict:
+    body = args.markdown if args.markdown is not None else sys.stdin.read()
+    if not body.strip():
+        raise MymindError("BadRequest", "Refusing to save an empty note.", 400)
+    meta = _build_meta(args, content={"type": "text/markdown", "body": body})
+    resp = request("POST", "/objects", json_body=meta)
+    return _save_result(resp, "note")
+
+
+def save_file_bytes(args, data: bytes, filename: str, mime: str, kind: str = "file") -> dict:
+    if len(data) > MAX_UPLOAD:
+        raise MymindError("PayloadTooLarge", "File exceeds the 64 MB upload cap.", 413)
+    if not data:
+        raise MymindError("BadRequest", "File is empty.", 400)
+    meta = _build_meta(args)
+    resp = request_multipart("/objects", meta, data, filename, mime)
+    return _save_result(resp, kind, {"filename": filename, "mime": mime, "bytes": len(data)})
+
+
+def cmd_save_file(args) -> dict:
+    path = os.path.expanduser(args.path)
+    if not os.path.isfile(path):
+        raise MymindError("NotFound", f"No such file: {path}", 404)
+    mime = args.mime or mimetypes.guess_type(path)[0] or "application/octet-stream"
+    with open(path, "rb") as fh:
+        data = fh.read()
+    return save_file_bytes(args, data, os.path.basename(path), mime)
+
+
+def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, check=False, capture_output=True, **kw)
+    except FileNotFoundError as exc:
+        raise MymindError("MissingTool", f"`{cmd[0]}` is not installed.") from exc
+
+
+def clipboard_probe() -> dict:
+    """Return {kind: url|text|image|empty, text?, mime?} without hitting the API."""
+    types_proc = _run(["wl-paste", "--list-types"])
+    types = types_proc.stdout.decode("utf-8", "replace").split() if types_proc.returncode == 0 else []
+    image_types = [t for t in types if t.startswith("image/")]
+    text_types = [t for t in types if t.startswith("text/") or t in ("UTF8_STRING", "STRING", "TEXT")]
+
+    if image_types and not text_types:
+        mime = "image/png" if "image/png" in image_types else image_types[0]
+        return {"kind": "image", "mime": mime}
+
+    text_proc = _run(["wl-paste", "--no-newline", "--type", "text"])
+    text = text_proc.stdout.decode("utf-8", "replace") if text_proc.returncode == 0 else ""
+    if not text.strip():
+        if image_types:
+            mime = "image/png" if "image/png" in image_types else image_types[0]
+            return {"kind": "image", "mime": mime}
+        return {"kind": "empty"}
+    stripped = text.strip()
+    if URL_RE.match(stripped) and "\n" not in stripped:
+        return {"kind": "url", "text": stripped}
+    return {"kind": "text", "text": text}
+
+
+def cmd_clipboard(args) -> dict:
+    probe = clipboard_probe()
+    if probe.get("text") and len(probe["text"]) > 4000:
+        probe["preview"] = probe["text"][:4000]
+    return {"ok": True, **probe}
+
+
+def cmd_save_clipboard(args) -> dict:
+    probe = clipboard_probe()
+    kind = probe["kind"]
+    if kind == "empty":
+        raise MymindError("BadRequest", "Clipboard is empty.", 400)
+    if kind == "url":
+        args.url = probe["text"]
+        return cmd_save_url(args)
+    if kind == "text":
+        args.markdown = probe["text"]
+        return cmd_save_note(args)
+    mime = probe["mime"]
+    data_proc = _run(["wl-paste", "--type", mime])
+    if data_proc.returncode != 0:
+        raise MymindError("Clipboard", "Could not read image from clipboard.")
+    ext = mimetypes.guess_extension(mime) or ".png"
+    name = time.strftime("clipboard-%Y-%m-%d-%H%M%S") + ext
+    return save_file_bytes(args, data_proc.stdout, name, mime, kind="image")
+
+
+def cmd_screenshot(args) -> dict:
+    mode = args.mode
+    proc = _run(["omarchy-capture-screenshot", mode, "save"])
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    # The capture prints the saved path; take the last non-empty line that exists.
+    path = ""
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line and os.path.isfile(os.path.expanduser(line)):
+            path = os.path.expanduser(line)
+            break
+    if not path:
+        raise MymindError("Cancelled", "Screenshot was cancelled or failed.", 0, {"cancelled": True})
+    args.path = path
+    args.mime = None
+    result = cmd_save_file(args)
+    result["kind"] = "screenshot"
+    result["path"] = path
+    if args.delete:
+        try:
+            os.remove(path)
+            result["deleted"] = True
+        except OSError:
+            result["deleted"] = False
+    return result
+
+
+def cmd_spaces(args) -> dict:
+    resp = request("GET", "/spaces")
+    spaces = [
+        {"id": s.get("id"), "name": s.get("name"), "color": s.get("color")}
+        for s in resp.json()
+        if isinstance(s, dict)
+    ]
+    spaces.sort(key=lambda s: (s["name"] or "").lower())
+    return {"ok": True, "spaces": spaces}
+
+
+def cmd_add_tags(args) -> dict:
+    tags = _tags(args.tags)
+    if not tags:
+        raise MymindError("BadRequest", "No tags given.", 400)
+    request("POST", f"/objects/{args.id}/tags", json_body=tags)
+    return {"ok": True, "id": args.id, "tags": [t["name"] for t in tags]}
+
+
+def cmd_add_note(args) -> dict:
+    body = args.markdown if args.markdown is not None else sys.stdin.read()
+    if not body.strip():
+        raise MymindError("BadRequest", "Refusing to add an empty note.", 400)
+    resp = request(
+        "POST", f"/objects/{args.id}/notes", raw_body=body.encode("utf-8"), content_type="text/markdown"
+    )
+    return {"ok": True, "id": args.id, "noteId": resp.json().get("id")}
+
+
+def cmd_add_to_space(args) -> dict:
+    request("PUT", f"/spaces/{args.space_id}/objects/{args.id}")
+    return {"ok": True, "id": args.id, "spaceId": args.space_id}
+
+
+def cmd_thumbnail(args) -> dict:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    key = hashlib.sha1(f"{args.id}:{args.size or 'full'}".encode()).hexdigest()
+    cache_path = os.path.join(CACHE_DIR, key)
+    if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+        return {"ok": True, "id": args.id, "path": cache_path, "cached": True}
+    resp = request(
+        "GET",
+        f"/objects/{args.id}/thumbnail",
+        query={"size": args.size} if args.size else None,
+        accept="image/*",
+        follow_redirects=False,
+    )
+    data = resp.body
+    if resp.status in (301, 302, 303, 307, 308):
+        location = resp.headers.get("Location")
+        if not location:
+            raise MymindError("BadResponse", "Redirect without Location header.")
+        req = urllib.request.Request(location, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+        except urllib.error.URLError as exc:
+            raise MymindError("Network", f"Thumbnail download failed: {exc.reason}") from exc
+    if not data:
+        raise MymindError("NotFound", "No thumbnail bytes returned.", 404)
+    tmp = cache_path + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, cache_path)
+    return {"ok": True, "id": args.id, "path": cache_path, "cached": False}
+
+
+def cmd_open(args) -> dict:
+    """Open the object's source URL (or its mymind page) in the default browser."""
+    target = None
+    if not args.app:
+        resp = request("GET", f"/objects/{args.id}")
+        obj = resp.json()
+        target = (obj.get("source") or {}).get("url") or obj.get("url")
+    target = target or app_url(args.id)
+    opener = "xdg-open"
+    if shutil.which("omarchy-launch-browser"):
+        opener = "omarchy-launch-browser"
+    subprocess.Popen([opener, target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"ok": True, "id": args.id, "opened": target}
+
+
+def cmd_clear_backoff(args) -> dict:
+    try:
+        os.remove(BACKOFF_PATH)
+    except FileNotFoundError:
+        pass
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+
+def add_meta_flags(p: argparse.ArgumentParser, notes: bool = True):
+    p.add_argument("--title")
+    p.add_argument("--tag", action="append", default=[], help="repeatable")
+    p.add_argument("--space", action="append", default=[], help="space id; repeatable")
+    if notes:
+        p.add_argument("--note", help="markdown note to attach")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="mymind", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("check", help="validate credentials and show quota").set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("search", help="search objects")
+    p.add_argument("query", nargs="+")
+    p.add_argument("--semantic", action="store_true")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=cmd_search)
+
+    p = sub.add_parser("get", help="fetch one object")
+    p.add_argument("id")
+    p.add_argument("--raw", action="store_true")
+    p.set_defaults(fn=cmd_get)
+
+    p = sub.add_parser("save-url", help="save a URL")
+    p.add_argument("url")
+    add_meta_flags(p)
+    p.set_defaults(fn=cmd_save_url)
+
+    p = sub.add_parser("save-note", help="save a markdown note (arg or stdin)")
+    p.add_argument("markdown", nargs="?")
+    add_meta_flags(p, notes=False)
+    p.set_defaults(fn=cmd_save_note)
+
+    p = sub.add_parser("save-file", help="upload a file")
+    p.add_argument("path")
+    p.add_argument("--mime")
+    add_meta_flags(p)
+    p.set_defaults(fn=cmd_save_file)
+
+    p = sub.add_parser("clipboard", help="inspect clipboard (no API call)")
+    p.set_defaults(fn=cmd_clipboard)
+
+    p = sub.add_parser("save-clipboard", help="save clipboard as URL, note or image")
+    add_meta_flags(p)
+    p.set_defaults(fn=cmd_save_clipboard)
+
+    p = sub.add_parser("screenshot", help="take a screenshot and upload it")
+    p.add_argument("--mode", choices=["region", "windows", "fullscreen", "smart"], default="region")
+    p.add_argument("--delete", action="store_true", help="delete the local file after upload")
+    add_meta_flags(p)
+    p.set_defaults(fn=cmd_screenshot)
+
+    sub.add_parser("spaces", help="list spaces").set_defaults(fn=cmd_spaces)
+
+    p = sub.add_parser("add-tags", help="add tags to an object")
+    p.add_argument("id")
+    p.add_argument("tags", nargs="+")
+    p.set_defaults(fn=cmd_add_tags)
+
+    p = sub.add_parser("add-note", help="attach a markdown note to an object")
+    p.add_argument("id")
+    p.add_argument("markdown", nargs="?")
+    p.set_defaults(fn=cmd_add_note)
+
+    p = sub.add_parser("add-to-space", help="add an object to a space")
+    p.add_argument("id")
+    p.add_argument("space_id")
+    p.set_defaults(fn=cmd_add_to_space)
+
+    p = sub.add_parser("thumbnail", help="download (and cache) an object's thumbnail")
+    p.add_argument("id")
+    p.add_argument("--size", help="WxH containment box, e.g. 96x96")
+    p.set_defaults(fn=cmd_thumbnail)
+
+    p = sub.add_parser("open", help="open an object's source URL in the browser")
+    p.add_argument("id")
+    p.add_argument("--app", action="store_true", help="open in mymind instead of the source URL")
+    p.set_defaults(fn=cmd_open)
+
+    sub.add_parser("clear-backoff", help="forget a recorded 429 back-off").set_defaults(fn=cmd_clear_backoff)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = args.fn(args)
+    except MymindError as exc:
+        problem = {"ok": False, **exc.problem}
+        print(json.dumps(problem))
+        print(f"mymind: {exc.problem['type']}: {exc.problem['detail']}", file=sys.stderr)
+        if exc.problem["type"] == "Cancelled":
+            return 3
+        if exc.problem["type"] in ("NotConfigured", "InsecureCredentials"):
+            return 2
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

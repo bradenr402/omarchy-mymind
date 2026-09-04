@@ -1,0 +1,7 @@
+# Never commit credentials. They live outside the repo anyway
+# (~/.config/mymind/credentials.json) but guard against copies.
+credentials.json
+*.secret
+__pycache__/
+*.pyc
+.DS_Store

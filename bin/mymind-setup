@@ -1,0 +1,87 @@
+#!/bin/bash
+# mymind-setup — store a mymind access key for the Omarchy mymind plugin.
+#
+# Creates ~/.config/mymind/credentials.json (mode 0600). The secret is only
+# ever written to that file; it is not echoed, logged, or sent anywhere except
+# in the HMAC signature of API requests.
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mymind"
+CREDS="${MYMIND_CREDENTIALS:-$CONFIG_DIR/credentials.json}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MYMIND="$HERE/mymind"
+
+have_gum() { command -v gum >/dev/null 2>&1; }
+
+say() {
+  if have_gum; then gum style --foreground 212 "$*"; else echo "$*"; fi
+}
+
+if [[ -f "$CREDS" ]]; then
+  echo "Existing credentials found at $CREDS"
+  if have_gum; then
+    gum confirm "Replace them?" || exit 0
+  else
+    read -r -p "Replace them? [y/N] " ans
+    [[ "$ans" =~ ^[Yy] ]] || exit 0
+  fi
+fi
+
+say "mymind access key setup"
+echo
+echo "1. Open https://access.mymind.com/extensions"
+echo "2. Create a new access key with FULL ACCESS (saving needs write)."
+echo "3. Copy the key id (kid) and the secret. The secret is shown only once."
+echo
+
+if have_gum; then
+  KID="$(gum input --placeholder "Key id (kid)" --prompt "kid > ")"
+  SECRET="$(gum input --password --placeholder "Secret (base64)" --prompt "secret > ")"
+else
+  read -r -p "kid > " KID
+  read -r -s -p "secret > " SECRET
+  echo
+fi
+
+KID="${KID//[[:space:]]/}"
+SECRET="${SECRET//[[:space:]]/}"
+
+if [[ -z "$KID" || -z "$SECRET" ]]; then
+  echo "Both kid and secret are required." >&2
+  exit 1
+fi
+
+mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
+umask 077
+python3 - "$CREDS" "$KID" "$SECRET" <<'PY'
+import json, os, sys
+path, kid, secret = sys.argv[1:4]
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump({"kid": kid, "secret": secret}, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PY
+unset SECRET
+
+echo
+echo "Saved to $CREDS (mode 600)."
+echo -n "Verifying with the API... "
+if out="$("$MYMIND" check 2>/dev/null)"; then
+  echo "ok"
+  echo "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for name, p in d.get("remaining", {}).items():
+    q = d.get("policy", {}).get(name, {}).get("q")
+    print(f"  {name}: {p.get(\"r\")}/{q} credits remaining")
+'
+else
+  echo "failed"
+  echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("  " + d.get("type","") + ": " + d.get("detail",""))' 2>/dev/null || true
+  echo "Check the kid/secret and re-run mymind-setup." >&2
+  exit 1
+fi

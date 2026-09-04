@@ -1,0 +1,35 @@
+#!/bin/bash
+# dev-install — copy this working tree into the live Omarchy plugin dir.
+#
+# Omarchy rejects symlinks inside plugin folders, so we rsync a copy. Saving
+# files under ~/.config/omarchy/plugins/ triggers the shell's hot reload.
+#
+# Usage: bin/dev-install [--watch]
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$HERE/manifest.json")"
+DEST="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$ID"
+
+sync() {
+  mkdir -p "$DEST"
+  rsync -a --delete \
+    --exclude '.git' --exclude '.gitignore' --exclude '__pycache__' \
+    --exclude 'credentials.json' \
+    "$HERE/" "$DEST/"
+  omarchy-plugin-validate "$DEST"
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  echo "synced -> $DEST"
+}
+
+sync
+
+if [[ "${1:-}" == "--watch" ]]; then
+  command -v inotifywait >/dev/null || { echo "inotifywait missing (pkg: inotify-tools)"; exit 1; }
+  echo "watching $HERE for changes..."
+  while inotifywait -qq -r -e modify,create,delete,move --exclude '\.git' "$HERE"; do
+    sleep 0.2
+    sync || true
+  done
+fi
