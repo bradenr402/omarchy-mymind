@@ -4,7 +4,7 @@
 # Omarchy rejects symlinks inside plugin folders, so we rsync a copy. Saving
 # files under ~/.config/omarchy/plugins/ triggers the shell's hot reload.
 #
-# Usage: bin/dev-install [--watch]
+# Usage: bin/dev-install [--watch]     (NO_RESTART=1 to skip the shell restart)
 
 set -euo pipefail
 
@@ -19,7 +19,13 @@ sync() {
     --exclude 'credentials.json' \
     "$HERE/" "$DEST/"
   omarchy-plugin-validate "$DEST"
-  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  # The shell's hot reload rescans manifests but keeps compiled QML cached,
+  # so QML edits only show up after a full shell restart.
+  if [[ "${NO_RESTART:-}" == "1" ]]; then
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  else
+    omarchy restart shell >/dev/null 2>&1 || true
+  fi
   echo "synced -> $DEST"
 }
 
