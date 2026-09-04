@@ -371,7 +371,8 @@ def _int_header(headers, name: str) -> int | None:
 
 
 def app_url(object_id: str | None) -> str | None:
-    return f"{APP_URL}/everything/{object_id}" if object_id else None
+    # The web app opens a card via a hash fragment on the "everything" view.
+    return f"{APP_URL}/everything#{object_id}" if object_id else None
 
 
 def summarize_object(obj: dict) -> dict:
