@@ -72,16 +72,23 @@ echo "Saved to $CREDS (mode 600)."
 echo -n "Verifying with the API... "
 if out="$("$MYMIND" check 2>/dev/null)"; then
   echo "ok"
-  echo "$out" | python3 -c '
+  python3 - "$out" <<'PY'
 import json, sys
-d = json.load(sys.stdin)
-for name, p in d.get("remaining", {}).items():
+d = json.loads(sys.argv[1])
+rem = d.get("remaining", {})
+if not rem:
+    print("  Credentials valid (API did not report quota headers).")
+for name, p in rem.items():
     q = d.get("policy", {}).get(name, {}).get("q")
-    print(f"  {name}: {p.get(\"r\")}/{q} credits remaining")
-'
+    print("  %s: %s/%s credits remaining" % (name, p.get("r"), q))
+PY
 else
   echo "failed"
-  echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("  " + d.get("type","") + ": " + d.get("detail",""))' 2>/dev/null || true
+  python3 - "$out" <<'PY' 2>/dev/null || true
+import json, sys
+d = json.loads(sys.argv[1])
+print("  " + str(d.get("type", "")) + ": " + str(d.get("detail", "")))
+PY
   echo "Check the kid/secret and re-run mymind-setup." >&2
   exit 1
 fi
