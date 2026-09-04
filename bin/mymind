@@ -86,6 +86,8 @@ class MymindError(Exception):
 
 
 def load_credentials() -> tuple[str, str]:
+    """Return (kid, secret). Also picks up an optional "apiUrl" override."""
+    global BASE_URL
     path = CREDENTIALS_PATH
     if not os.path.exists(path):
         raise MymindError(
@@ -102,6 +104,8 @@ def load_credentials() -> tuple[str, str]:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         kid, secret = data["kid"], data["secret"]
+        if data.get("apiUrl") and not os.environ.get("MYMIND_API_URL"):
+            BASE_URL = str(data["apiUrl"])
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise MymindError("NotConfigured", f"Malformed credentials file: {exc}") from exc
     if not kid or not secret:
