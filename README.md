@@ -72,11 +72,11 @@ Add to `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
 
 ```jsonc
 "trigger.mymind":                {"icon":"󰧑","label":"mymind","aliases":["mymind"]},
-"trigger.mymind.search":         {"icon":"","label":"Search","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"search\"}'"},
-"trigger.mymind.save-clipboard": {"icon":"","label":"Save Clipboard","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"save\"}'"},
+"trigger.mymind.search":         {"icon":"󰍉","label":"Search","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"search\"}'"},
+"trigger.mymind.save-clipboard": {"icon":"󰆒","label":"Save Clipboard","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"save\"}'"},
 "trigger.mymind.note":           {"icon":"󰎞","label":"New Note","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"note\"}'"},
 "trigger.mymind.screenshot":     {"icon":"󰄀","label":"Save Screenshot","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"screenshot\"}'"},
-"setup.mymind":                  {"icon":"󰧑","label":"mymind Access Key","action":"omarchy-launch-floating-terminal-with-presentation ~/.config/omarchy/plugins/braden.mymind/bin/mymind-setup"},
+"setup.mymind":                  {"icon":"󰌆","label":"mymind Access Key","action":"omarchy-launch-floating-terminal-with-presentation ~/.config/omarchy/plugins/braden.mymind/bin/mymind-setup"},
 ```
 
 ## Summon payloads
