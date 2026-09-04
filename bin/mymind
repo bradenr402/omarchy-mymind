@@ -9,7 +9,6 @@ Used by the Omarchy shell plugin (braden.mymind), but also usable directly:
     mymind save-note "# markdown" [--title T] [--tag t]... [--space ID]...
     mymind save-file ./photo.png [--title T] [--tag t]... [--space ID]...
     mymind save-clipboard [--tag t]... [--note MD]
-    mymind screenshot [--mode region|windows|fullscreen] [--tag t]...
     mymind spaces
     mymind add-tags <id> tag [tag...]
     mymind add-note <id> "markdown"
@@ -544,33 +543,6 @@ def cmd_save_clipboard(args) -> dict:
     return save_file_bytes(args, data_proc.stdout, name, mime, kind="image")
 
 
-def cmd_screenshot(args) -> dict:
-    mode = args.mode
-    proc = _run(["omarchy-capture-screenshot", mode, "save"])
-    out = proc.stdout.decode("utf-8", "replace").strip()
-    # The capture prints the saved path; take the last non-empty line that exists.
-    path = ""
-    for line in reversed(out.splitlines()):
-        line = line.strip()
-        if line and os.path.isfile(os.path.expanduser(line)):
-            path = os.path.expanduser(line)
-            break
-    if not path:
-        raise MymindError("Cancelled", "Screenshot was cancelled or failed.", 0, {"cancelled": True})
-    args.path = path
-    args.mime = None
-    result = cmd_save_file(args)
-    result["kind"] = "screenshot"
-    result["path"] = path
-    if args.delete:
-        try:
-            os.remove(path)
-            result["deleted"] = True
-        except OSError:
-            result["deleted"] = False
-    return result
-
-
 def cmd_spaces(args) -> dict:
     resp = request("GET", "/spaces")
     spaces = [
@@ -714,12 +686,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("save-clipboard", help="save clipboard as URL, note or image")
     add_meta_flags(p)
     p.set_defaults(fn=cmd_save_clipboard)
-
-    p = sub.add_parser("screenshot", help="take a screenshot and upload it")
-    p.add_argument("--mode", choices=["region", "windows", "fullscreen", "smart"], default="region")
-    p.add_argument("--delete", action="store_true", help="delete the local file after upload")
-    add_meta_flags(p)
-    p.set_defaults(fn=cmd_screenshot)
 
     sub.add_parser("spaces", help="list spaces").set_defaults(fn=cmd_spaces)
 

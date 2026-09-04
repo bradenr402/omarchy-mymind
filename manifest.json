@@ -4,7 +4,7 @@
   "name": "mymind",
   "version": "0.1.0",
   "author": "Braden",
-  "description": "Search your mymind, and save URLs, notes, clipboard contents and screenshots to it",
+  "description": "Search your mymind, and save URLs, notes and clipboard contents (text or images) to it",
   "kinds": ["overlay", "bar-widget"],
   "keepLoaded": true,
   "entryPoints": {

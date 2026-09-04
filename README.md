@@ -1,8 +1,8 @@
 # omarchy-mymind
 
 An [Omarchy](https://omarchy.org) shell plugin for [mymind](https://mymind.com).
-Search your mind from a keyboard-first overlay, and save links, notes, clipboard
-contents and screenshots to it without leaving your desktop.
+Search your mind from a keyboard-first overlay, and save links, notes and
+clipboard contents to it without leaving your desktop.
 
 Plugin id: `braden.mymind`
 
@@ -11,9 +11,8 @@ Plugin id: `braden.mymind`
 | Mode | What it does |
 |------|--------------|
 | **Search** | Type to search (keyword by default, `Tab` toggles semantic). Enter opens the source URL, `Ctrl+Enter` opens the item in mymind, `Ctrl+Y` copies the URL. Thumbnails are fetched lazily and cached. |
-| **Save clipboard** | Detects a URL, text, or image on the clipboard and saves it as a link, note, or image. |
+| **Save clipboard** | Detects a URL, text, or image on the clipboard and saves it as a link, note, or image. For screenshots: press `PRINT` (Omarchy copies the capture to the clipboard), then save the clipboard. |
 | **New note** | Markdown editor; `Ctrl+Enter` saves. |
-| **Screenshot** | Region capture via `omarchy capture screenshot`, uploaded as an image. |
 | **After saving** | Optional follow-up card: add tags, a note, or put the item in a space. Nothing is added by default — `Esc` skips. |
 | **Bar widget** | Brain glyph in the bar. Left click: search. Right click: save clipboard. Middle click: new note. |
 
@@ -63,7 +62,6 @@ Add to `~/.config/hypr/bindings.lua` (adjust to taste):
 o.bind("SUPER + ALT + PERIOD", "mymind: search",          "omarchy-shell shell toggle braden.mymind '{\"mode\":\"search\"}'")
 o.bind("SUPER + ALT + M",      "mymind: save clipboard",  "omarchy-shell shell summon braden.mymind '{\"mode\":\"save\"}'")
 o.bind("SUPER + ALT + N",      "mymind: new note",        "omarchy-shell shell summon braden.mymind '{\"mode\":\"note\"}'")
-o.bind("SUPER + ALT + PRINT",  "mymind: save screenshot", "omarchy-shell shell summon braden.mymind '{\"mode\":\"screenshot\"}'")
 ```
 
 ### Menu entries
@@ -75,7 +73,6 @@ Add to `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
 "trigger.mymind.search":         {"icon":"󰍉","label":"Search","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"search\"}'"},
 "trigger.mymind.save-clipboard": {"icon":"󰆒","label":"Save Clipboard","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"save\"}'"},
 "trigger.mymind.note":           {"icon":"󰎞","label":"New Note","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"note\"}'"},
-"trigger.mymind.screenshot":     {"icon":"󰄀","label":"Save Screenshot","action":"omarchy-shell shell summon braden.mymind '{\"mode\":\"screenshot\"}'"},
 "setup.mymind":                  {"icon":"󰌆","label":"mymind Access Key","action":"omarchy-launch-floating-terminal-with-presentation ~/.config/omarchy/plugins/braden.mymind/bin/mymind-setup"},
 ```
 
@@ -85,12 +82,11 @@ Add to `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
 
 | Field | Values |
 |-------|--------|
-| `mode` | `search` (default), `save`, `note`, `screenshot` |
+| `mode` | `search` (default), `save`, `note` |
 | `query` | Pre-fill the search box (`search` mode) |
 | `text` | Pre-fill the editor (`note` mode) |
-| `captureMode` | `region` (default), `windows`, `fullscreen`, `smart` (`screenshot` mode) |
 
-IPC shortcuts via the bar widget: `omarchy-shell braden.mymind search|save|note|screenshot`.
+IPC shortcuts via the bar widget: `omarchy-shell braden.mymind search|save|note`.
 
 ## CLI
 
@@ -101,7 +97,6 @@ mymind save-url <url> [--title T] [--tag t]... [--note MD] [--space ID]...
 mymind save-note "<markdown>"          # or via stdin
 mymind save-file <path>
 mymind save-clipboard
-mymind screenshot [--mode region] [--delete]
 mymind spaces
 mymind add-tags <id> tag [tag...]
 mymind add-note <id> "<markdown>"

@@ -33,7 +33,6 @@ BarWidget {
     function search(): void { root.toggleSearch() }
     function save(): void { root.summon("save") }
     function note(): void { root.summon("note") }
-    function screenshot(): void { root.summon("screenshot") }
   }
 
   BarIconButton {

@@ -10,7 +10,6 @@ import qs.Ui
 //   search  — type to search your mind, Enter opens the source URL
 //   save    — save whatever is on the clipboard (URL / text / image)
 //   note    — write a Markdown note and save it
-//   screenshot — region capture, uploaded as an image
 //   saved   — post-save follow-up: add tags, a note, or a space
 //
 // Summon with: omarchy-shell shell summon braden.mymind '{"mode":"search"}'
@@ -78,13 +77,6 @@ Item {
     root.status = ""
     root.statusIsError = false
     root.saved = null
-
-    if (next === "screenshot") {
-      // The scrim would cover the screen; capture first, show results after.
-      root.opened = false
-      root.startScreenshot(payload.captureMode || "region")
-      return
-    }
 
     root.mode = next
     root.opened = true
@@ -240,19 +232,11 @@ Item {
     saveProc.running = true
   }
 
-  function startScreenshot(captureMode) {
-    root.busy = true
-    root.busyLabel = "Capturing…"
-    saveProc.command = [root.cli, "screenshot", "--mode", captureMode]
-    saveProc.running = true
-  }
-
   function applySaveResult(res) {
     root.busy = false
     if (!res.ok) {
       if (res.cancelled) { root.dismiss(); return }
       root.setStatus(root.describeError(res), true)
-      if (!root.opened) root.notify("mymind", root.describeError(res))
       return
     }
     root.saved = res
@@ -261,7 +245,7 @@ Item {
     tagsField.text = ""
     followupNote.text = ""
     spaceDropdown.value = ""
-    var what = res.kind === "url" ? "Link" : res.kind === "note" ? "Note" : res.kind === "screenshot" ? "Screenshot" : res.kind === "image" ? "Image" : "Item"
+    var what = res.kind === "url" ? "Link" : res.kind === "note" ? "Note" : res.kind === "image" ? "Image" : "Item"
     root.setStatus(what + (res.bumped ? " already in your mind — bumped" : " saved") + (res.cost ? " · " + res.cost + " cr" : ""), false)
     Qt.callLater(function() { tagsField.forceActiveFocus() })
   }
