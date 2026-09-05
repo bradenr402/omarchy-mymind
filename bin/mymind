@@ -44,7 +44,20 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.0"
+def _plugin_version() -> str:
+    """Read the version from manifest.json (single source of truth).
+
+    realpath() matters: ~/.local/bin/mymind is a symlink into the plugin dir.
+    """
+    manifest = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "manifest.json")
+    try:
+        with open(manifest, encoding="utf-8") as fh:
+            return str(json.load(fh)["version"])
+    except (OSError, ValueError, KeyError):
+        return "0.0.0"
+
+
+VERSION = _plugin_version()
 USER_AGENT = f"omarchy-mymind/{VERSION}"
 BASE_URL = os.environ.get("MYMIND_API_URL", "https://api.mymind.com")
 APP_URL = "https://access.mymind.com"
