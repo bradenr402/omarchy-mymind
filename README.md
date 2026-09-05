@@ -23,7 +23,8 @@ manifest.json      Omarchy plugin manifest (overlay + bar-widget)
 Overlay.qml        The overlay UI (all modes)
 BarWidget.qml      Bar icon + IPC handler
 bin/mymind         Python 3 (stdlib only) API client: JWT signing, requests, 429 back-off
-bin/mymind-setup   Interactive access-key setup (writes ~/.config/mymind/credentials.json, 0600)
+bin/setup          One-shot setup: PATH symlinks, access key, keybindings, menu entries
+bin/mymind-setup   Access-key prompt only (writes ~/.config/mymind/credentials.json, 0600)
 bin/dev-install    Copies the working tree into ~/.config/omarchy/plugins/ and restarts the shell
 test/mock_api.py   Fake API server for UI testing without spending credits
 ```
@@ -36,49 +37,39 @@ the CLI useful on its own.
 
 ```bash
 omarchy plugin add https://github.com/bradenr402/omarchy-mymind.git --enable
+~/.config/omarchy/plugins/bradenr402.mymind/bin/setup
 ```
 
-This places the bar widget in its default section; move it with
-`omarchy bar move bradenr402.mymind --section right`.
+`setup` walks you through the rest, asking before each step:
+
+1. Puts the `mymind` and `mymind-setup` commands on your PATH (`~/.local/bin`).
+2. Stores your access key (see below) if you haven't already.
+3. Adds keybindings to `~/.config/hypr/bindings.lua`:
+   `Super+Alt+.` search, `Super+Alt+M` save clipboard, `Super+Alt+N` new note.
+   Skipped if any of those keys is already bound.
+4. Adds *Trigger > mymind* and *Setup > mymind Access Key* to the Omarchy menu.
+5. Enables the plugin with the bar widget in the right section.
+
+Config edits live between `omarchy-mymind` marker comments; re-running `setup`
+refreshes them and `setup --uninstall` removes them. `setup --yes` skips the
+prompts. Nothing outside the markers is touched, and no step needs sudo.
 
 Requirements: Omarchy 4 (Quattro), `python3` (stdlib only), `wl-clipboard`,
-and `gum` for the interactive setup. The plugin talks only to
+and `gum` for the interactive prompts. The plugin talks only to
 `api.mymind.com`, using an access key you supply.
-
-For development from a checkout, see [Development](#development).
 
 ### Access key
 
-1. Create a key at <https://access.mymind.com/extensions>. Pick **Full access**
-   (saving needs write). The secret is shown once.
-2. Run `~/.config/omarchy/plugins/bradenr402.mymind/bin/mymind-setup` and paste the
-   `kid` and `secret`. It stores them in `~/.config/mymind/credentials.json`
-   with mode `0600` and verifies them with a 1-credit request.
+Create a key at <https://access.mymind.com/extensions> with **Full access**
+(saving needs write); the secret is shown once. `setup` (or `mymind-setup` on
+its own) stores it in `~/.config/mymind/credentials.json` with mode `0600` and
+verifies it with a 1-credit request.
 
 The secret never leaves the machine; it is only used to HMAC-sign short-lived
 JWTs bound to each request's method and path.
 
-### Keybindings
-
-Add to `~/.config/hypr/bindings.lua` (adjust to taste):
-
-```lua
-o.bind("SUPER + ALT + PERIOD", "mymind: search",          "omarchy-shell shell toggle bradenr402.mymind '{\"mode\":\"search\"}'")
-o.bind("SUPER + ALT + M",      "mymind: save clipboard",  "omarchy-shell shell summon bradenr402.mymind '{\"mode\":\"save\"}'")
-o.bind("SUPER + ALT + N",      "mymind: new note",        "omarchy-shell shell summon bradenr402.mymind '{\"mode\":\"note\"}'")
-```
-
-### Menu entries
-
-Add to `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
-
-```jsonc
-"trigger.mymind":                {"icon":"󰧑","label":"mymind","aliases":["mymind"]},
-"trigger.mymind.search":         {"icon":"󰍉","label":"Search","action":"omarchy-shell shell summon bradenr402.mymind '{\"mode\":\"search\"}'"},
-"trigger.mymind.save-clipboard": {"icon":"󰆒","label":"Save Clipboard","action":"omarchy-shell shell summon bradenr402.mymind '{\"mode\":\"save\"}'"},
-"trigger.mymind.note":           {"icon":"󰎞","label":"New Note","action":"omarchy-shell shell summon bradenr402.mymind '{\"mode\":\"note\"}'"},
-"setup.mymind":                  {"icon":"󰌆","label":"mymind Access Key","action":"omarchy-launch-floating-terminal-with-presentation ~/.config/omarchy/plugins/bradenr402.mymind/bin/mymind-setup"},
-```
+Prefer different keys or menu placement? Run `setup`, decline steps 3–4, and
+copy what you want from `bin/setup` (`bindings_block` / `menu_block`).
 
 ## Summon payloads
 
@@ -117,18 +108,17 @@ footer.
 ## Remove
 
 ```bash
+~/.config/omarchy/plugins/bradenr402.mymind/bin/setup --uninstall
 omarchy plugin remove bradenr402.mymind
 ```
 
-The plugin leaves your access key and caches in place so a reinstall keeps
-working. Delete them yourself if you want a clean slate:
+The first line removes the CLI symlinks, keybindings and menu entries; the
+second removes the plugin. Your access key and caches are left in place so a
+reinstall keeps working. For a clean slate:
 
 ```bash
 rm -rf ~/.config/mymind ~/.cache/omarchy-mymind ~/.local/state/omarchy-mymind
 ```
-
-Also remove any keybindings and menu entries you added from the snippets
-above.
 
 ## Development
 
@@ -136,7 +126,7 @@ above.
 git clone https://github.com/bradenr402/omarchy-mymind.git ~/Projects/omarchy-mymind
 cd ~/Projects/omarchy-mymind
 bin/dev-install
-omarchy plugin enable bradenr402.mymind --section right
+~/.config/omarchy/plugins/bradenr402.mymind/bin/setup
 ```
 
 ```bash

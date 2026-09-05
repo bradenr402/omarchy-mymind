@@ -1,0 +1,234 @@
+#!/bin/bash
+# setup — one-shot setup for the mymind Omarchy plugin.
+#
+#   setup              interactive: does everything below, asking before each step
+#   setup --yes        non-interactive, accept all defaults
+#   setup --uninstall  remove the CLI symlinks, keybindings and menu entries this
+#                      script added (credentials are left alone)
+#
+# Steps:
+#   1. Put `mymind` and `mymind-setup` on your PATH (~/.local/bin symlinks)
+#   2. Store your mymind access key (runs mymind-setup) if not already done
+#   3. Add keybindings to ~/.config/hypr/bindings.lua
+#   4. Add a Trigger > mymind submenu and a Setup entry to the Omarchy menu
+#   5. Make sure the plugin is enabled with the bar widget placed
+#
+# Config edits are wrapped in "omarchy-mymind" marker comments so they can be
+# updated or removed cleanly. Nothing outside those markers is touched.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="$(dirname "$HERE")"
+PLUGIN_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$PLUGIN_DIR/manifest.json")"
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
+BIN_DIR="$HOME/.local/bin"
+BINDINGS="$CONFIG/hypr/bindings.lua"
+MENU="$CONFIG/omarchy/extensions/omarchy-menu.jsonc"
+CREDS="${MYMIND_CREDENTIALS:-$CONFIG/mymind/credentials.json}"
+
+BEGIN="-- BEGIN omarchy-mymind (managed by bin/setup)"
+END="-- END omarchy-mymind"
+JBEGIN="  // BEGIN omarchy-mymind (managed by bin/setup)"
+JEND="  // END omarchy-mymind"
+
+YES=false
+UNINSTALL=false
+for a in "$@"; do
+  case $a in
+    --yes|-y) YES=true ;;
+    --uninstall) UNINSTALL=true ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $a" >&2; exit 1 ;;
+  esac
+done
+
+have_gum() { command -v gum >/dev/null 2>&1; }
+info() { if have_gum; then gum style --foreground 212 "$*"; else echo "== $*"; fi; }
+ok()   { echo "  ✓ $*"; }
+skip() { echo "  · $*"; }
+
+confirm() {
+  $YES && return 0
+  if have_gum; then gum confirm "$1"; else read -r -p "$1 [Y/n] " a; [[ -z $a || $a =~ ^[Yy] ]]; fi
+}
+
+# Shell command for a summon/toggle. $3 = "esc" backslash-escapes the inner
+# double quotes for embedding in a Lua or JSON "..." string.
+summon() {
+  local cmd
+  cmd="$(printf "omarchy-shell shell %s %s '{\"mode\":\"%s\"}'" "$1" "$PLUGIN_ID" "$2")"
+  if [[ ${3:-} == esc ]]; then printf '%s' "${cmd//\"/\\\"}"; else printf '%s' "$cmd"; fi
+}
+
+# --------------------------------------------------------------------------- #
+# Blocks
+# --------------------------------------------------------------------------- #
+
+bindings_block() {
+  cat <<EOF
+$BEGIN
+o.bind("SUPER + ALT + PERIOD", "mymind: Search",         "$(summon toggle search esc)")
+o.bind("SUPER + ALT + M",      "mymind: Save clipboard", "$(summon summon save esc)")
+o.bind("SUPER + ALT + N",      "mymind: New note",       "$(summon summon note esc)")
+$END
+EOF
+}
+
+menu_block() {
+  cat <<EOF
+$JBEGIN
+  "trigger.mymind": {"icon":"󰧑","label":"mymind","aliases":["mymind"],"description":"Search and save to your mind"},
+  "trigger.mymind.search": {"icon":"󰍉","label":"Search","action":"$(summon summon search esc)"},
+  "trigger.mymind.save-clipboard": {"icon":"󰆒","label":"Save Clipboard","description":"URL, text or image","action":"$(summon summon save esc)"},
+  "trigger.mymind.note": {"icon":"󰎞","label":"New Note","action":"$(summon summon note esc)"},
+  "trigger.mymind.open": {"icon":"󰏌","label":"Open mymind","action":"omarchy-launch-webapp https://access.mymind.com"},
+  "setup.mymind": {"icon":"󰌆","label":"mymind Access Key","description":"Store your mymind API key","action":"omarchy-launch-floating-terminal-with-presentation $PLUGIN_DIR/bin/mymind-setup"},
+$JEND
+EOF
+}
+
+# Remove a marked block from a file (no-op if absent).
+strip_block() { # file begin end
+  [[ -f $1 ]] || return 0
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys, re
+path, b, e = sys.argv[1:4]
+s = open(path, encoding="utf-8").read()
+pat = re.compile(r"\n?" + re.escape(b) + r".*?" + re.escape(e) + r"\n?", re.S)
+new = pat.sub("\n", s, count=1).rstrip("\n") + "\n"
+if new != s:
+    open(path, "w", encoding="utf-8").write(new)
+PY
+}
+
+has_block() { [[ -f $1 ]] && grep -qF -- "$2" "$1"; }
+
+# --------------------------------------------------------------------------- #
+# Uninstall
+# --------------------------------------------------------------------------- #
+
+if $UNINSTALL; then
+  info "Removing omarchy-mymind integration"
+  for b in mymind mymind-setup; do
+    if [[ -L $BIN_DIR/$b ]]; then rm "$BIN_DIR/$b"; ok "removed $BIN_DIR/$b"; fi
+  done
+  if has_block "$BINDINGS" "$BEGIN"; then strip_block "$BINDINGS" "$BEGIN" "$END"; ok "removed keybindings"; hyprctl reload >/dev/null 2>&1 || true; fi
+  if has_block "$MENU" "$JBEGIN"; then
+    # JSONC: the block lives inside the top-level object; strip it, then make
+    # sure the closing brace is still there.
+    strip_block "$MENU" "$JBEGIN" "$JEND"; ok "removed menu entries"
+  fi
+  echo
+  echo "Left in place: $CREDS, ~/.cache/omarchy-mymind, ~/.local/state/omarchy-mymind"
+  echo "To remove the plugin itself: omarchy plugin remove $PLUGIN_ID"
+  exit 0
+fi
+
+# --------------------------------------------------------------------------- #
+# Install
+# --------------------------------------------------------------------------- #
+
+info "mymind plugin setup ($PLUGIN_ID)"
+echo
+
+# 1. CLI on PATH
+info "1/5 Command-line tools"
+mkdir -p "$BIN_DIR"
+for b in mymind mymind-setup; do
+  target="$BIN_DIR/$b"
+  if [[ -L $target && $(readlink -f "$target") == "$(readlink -f "$HERE/$b")" ]]; then
+    skip "$target already linked"
+  elif [[ -e $target && ! -L $target ]]; then
+    skip "$target exists and is not a symlink; leaving it alone"
+  else
+    ln -sfn "$HERE/$b" "$target"; ok "linked $target"
+  fi
+done
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *) echo "  ! $BIN_DIR is not on your PATH; add it to your shell rc to use \`mymind\` directly." ;;
+esac
+echo
+
+# 2. Credentials
+info "2/5 Access key"
+if [[ -f $CREDS ]]; then
+  skip "credentials already at $CREDS"
+elif confirm "Store your mymind access key now?"; then
+  "$HERE/mymind-setup"
+else
+  skip "skipped; run mymind-setup later (or Setup > mymind Access Key in the menu)"
+fi
+echo
+
+# 3. Keybindings
+info "3/5 Keybindings (Super+Alt+. search, Super+Alt+M save clipboard, Super+Alt+N note)"
+if has_block "$BINDINGS" "$BEGIN"; then
+  strip_block "$BINDINGS" "$BEGIN" "$END"
+  { echo; bindings_block; } >> "$BINDINGS"
+  ok "refreshed managed block in $BINDINGS"
+  hyprctl reload >/dev/null 2>&1 || true
+elif grep -qE 'SUPER \+ ALT \+ (PERIOD|M|N)"' "$BINDINGS" 2>/dev/null; then
+  skip "one of those keys is already bound in $BINDINGS; not adding. Copy from README if wanted."
+elif confirm "Add keybindings to $BINDINGS?"; then
+  mkdir -p "$(dirname "$BINDINGS")"; touch "$BINDINGS"
+  { echo; bindings_block; } >> "$BINDINGS"
+  ok "added"
+  if hyprctl reload >/dev/null 2>&1; then
+    errs="$(hyprctl configerrors 2>/dev/null || true)"
+    [[ -z $errs ]] || echo "  ! hyprctl configerrors: $errs"
+  fi
+else
+  skip "skipped"
+fi
+echo
+
+# 4. Menu
+info "4/5 Omarchy menu (Trigger > mymind, Setup > mymind Access Key)"
+add_menu_block() {
+  mkdir -p "$(dirname "$MENU")"
+  if [[ ! -f $MENU ]]; then printf '{\n}\n' > "$MENU"; fi
+  python3 - "$MENU" "$(menu_block)" <<'PY'
+import sys, re
+path, block = sys.argv[1:3]
+s = open(path, encoding="utf-8").read()
+# Insert before the final closing brace of the top-level object.
+i = s.rstrip().rfind("}")
+if i < 0:
+    s = "{\n" + block + "\n}\n"
+else:
+    head = s[:i].rstrip()
+    # Ensure the previous entry ends with a comma (JSONC allows trailing commas).
+    if head.endswith("{"):
+        pass
+    elif not head.endswith(","):
+        head += ","
+    s = head + "\n\n" + block + "\n" + s[i:]
+open(path, "w", encoding="utf-8").write(s)
+PY
+}
+if has_block "$MENU" "$JBEGIN"; then
+  strip_block "$MENU" "$JBEGIN" "$JEND"; add_menu_block; ok "refreshed managed block in $MENU"
+elif confirm "Add menu entries to $MENU?"; then
+  add_menu_block; ok "added"
+else
+  skip "skipped"
+fi
+echo
+
+# 5. Enable + bar placement
+info "5/5 Plugin enabled"
+if omarchy plugin list 2>/dev/null | grep -qE "^$PLUGIN_ID\s+enabled"; then
+  skip "already enabled"
+else
+  omarchy plugin enable "$PLUGIN_ID" --section right >/dev/null 2>&1 && ok "enabled; bar widget placed in the right section" \
+    || echo "  ! could not enable; run: omarchy plugin enable $PLUGIN_ID --section right"
+fi
+echo
+
+info "Done"
+echo "  Super+Alt+.  search        Super+Alt+M  save clipboard        Super+Alt+N  new note"
+echo "  Bar icon: click = search, right-click = save clipboard, middle-click = new note"
+echo "  CLI: mymind --help"
