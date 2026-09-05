@@ -1,11 +1,15 @@
 {
   "schemaVersion": 1,
-  "id": "braden.mymind",
+  "id": "bradenr402.mymind",
   "name": "mymind",
-  "version": "0.1.0",
-  "author": "Braden",
+  "version": "1.0.0",
+  "author": "Braden Roth",
+  "license": "MIT",
   "description": "Search your mymind, and save URLs, notes and clipboard contents (text or images) to it",
-  "kinds": ["overlay", "bar-widget"],
+  "kinds": [
+    "overlay",
+    "bar-widget"
+  ],
   "keepLoaded": true,
   "entryPoints": {
     "overlay": "Overlay.qml",
@@ -21,7 +25,11 @@
       "semantic": false
     },
     "schema": [
-      { "key": "semantic", "type": "boolean", "label": "Semantic search by default" }
+      {
+        "key": "semantic",
+        "type": "boolean",
+        "label": "Semantic search by default"
+      }
     ]
   }
 }

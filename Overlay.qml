@@ -12,7 +12,7 @@ import qs.Ui
 //   note    — write a Markdown note and save it
 //   saved   — post-save follow-up: add tags, a note, or a space
 //
-// Summon with: omarchy-shell shell summon braden.mymind '{"mode":"search"}'
+// Summon with: omarchy-shell shell summon bradenr402.mymind '{"mode":"search"}'
 
 Item {
   id: root
@@ -21,7 +21,7 @@ Item {
   property var shell: null
   property var manifest: null
 
-  readonly property string pluginId: (manifest && manifest.id) || "braden.mymind"
+  readonly property string pluginId: (manifest && manifest.id) || "bradenr402.mymind"
   readonly property string cli: String(Qt.resolvedUrl("bin/mymind")).replace(/^file:\/\//, "")
 
   property bool opened: false

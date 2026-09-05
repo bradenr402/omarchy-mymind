@@ -10,9 +10,9 @@ import qs.Ui
 //   middle click → new note
 BarWidget {
   id: root
-  moduleName: "braden.mymind"
+  moduleName: "bradenr402.mymind"
 
-  readonly property string pluginId: "braden.mymind"
+  readonly property string pluginId: "bradenr402.mymind"
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -28,7 +28,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "braden.mymind"
+    target: "bradenr402.mymind"
 
     function search(): void { root.toggleSearch() }
     function save(): void { root.summon("save") }
