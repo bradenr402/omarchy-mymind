@@ -6,6 +6,8 @@ clipboard contents to it without leaving your desktop.
 
 Plugin id: `bradenr402.mymind`
 
+![The mymind search overlay on an Omarchy desktop](preview.png)
+
 ## Features
 
 | Mode | What it does |
