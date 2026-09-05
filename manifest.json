@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "Braden Roth",
   "license": "MIT",
-  "description": "Search your mymind, and save URLs, notes and clipboard contents (text or images) to it",
+  "description": "Save your clipboard, notes and links to mymind with a keystroke, and search your mind with keyword or semantic search",
   "kinds": [
     "overlay",
     "bar-widget"
@@ -17,7 +17,7 @@
   },
   "barWidget": {
     "displayName": "mymind",
-    "description": "Opens the mymind search overlay; right-click saves the clipboard",
+    "description": "Click: search your mind. Right-click: save clipboard. Middle-click: new note",
     "category": "Productivity",
     "allowMultiple": false,
     "defaultSection": "right",
