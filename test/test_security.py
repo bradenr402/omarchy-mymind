@@ -6,15 +6,15 @@
 Runs entirely offline against throwaway HOME/XDG dirs and a local HTTP server.
 Covers the marketplace review blockers:
 
-  1. omarchy-mymind-setup never puts the secret in argv (checked via a python3 shim
-     that records its argv); note bodies are accepted on stdin.
-  2. bin/setup refuses to replace foreign / relative / dangling symlinks in
-     ~/.local/bin, and --uninstall leaves them untouched.
+  1. Unified setup dispatch, terminal requirements, and secret handling (including
+     /proc cmdline/environ); note bodies are accepted on stdin.
+  2. Setup refuses to replace foreign / relative / dangling symlinks in
+     ~/.local/bin, is idempotent, and uninstalls only its managed integration.
   3. bin/omarchy-mymind bounds every network body (JSON, error, image), rejects
      oversized / chunked / endless responses, and refuses thumbnail redirects
      to off-domain, loopback, non-https or userinfo URLs.
 """
-import base64, hashlib, hmac, json, os, shutil, subprocess, sys, tempfile, threading, time
+import base64, errno, hashlib, hmac, json, os, pty, select, shutil, signal, subprocess, sys, tempfile, termios, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -178,6 +178,91 @@ class Hostile(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------- #
 
 
+def terminal_run(argv, env, replies=(), timeout=15):
+    """Send replies only after prompts; never put a secret in argv/env or echo it.
+
+    A separate session lets timeout cleanup kill the shell and all its helpers.
+    Both stdin and stdout are terminals, including with gum command substitution.
+    """
+    master, slave = pty.openpty()
+    attrs = termios.tcgetattr(slave)
+    attrs[3] &= ~(termios.ECHO | termios.ECHONL)
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    output = bytearray()
+    pending = list(replies)
+    consumed = 0
+    proc = None
+    timed_out = False
+    try:
+        proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
+                                env=env, start_new_session=True)
+        os.close(slave)
+        slave = None
+        deadline = time.monotonic() + timeout
+        while True:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            if not select.select([master], [], [], min(0.1, max(0, deadline - time.monotonic())))[0]:
+                if proc.poll() is not None:
+                    break
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > 1024 * 1024:
+                raise AssertionError("PTY output exceeded 1 MiB")
+            if pending:
+                prompt, reply = pending[0]
+                pos = output.find(prompt.encode(), consumed)
+                if pos >= 0:
+                    os.write(master, (reply + "\n").encode())
+                    consumed = pos + len(prompt.encode())
+                    pending.pop(0)
+        if timed_out:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        proc.wait(timeout=5 if timed_out else max(0.1, deadline - time.monotonic()))
+    finally:
+        if proc is not None and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+        os.close(master)
+        if slave is not None:
+            os.close(slave)
+    text = output.decode(errors="replace")
+    # Do not print the transcript in assertion details: that could disclose a leak.
+    check("PTY command completes before deadline", not timed_out)
+    check("PTY command consumes expected prompts", not pending)
+    check("secret not echoed in terminal transcript", SECRET_B64 not in text)
+    return subprocess.CompletedProcess(argv, proc.returncode, text, "")
+
+
+def snapshot(root):
+    """Include empty dirs, file contents/modes and literal symlink targets."""
+    result = {}
+    for parent, dirs, files in os.walk(root):
+        for name in dirs + files:
+            path = os.path.join(parent, name)
+            rel = os.path.relpath(path, root)
+            if os.path.islink(path):
+                result[rel] = ("link", os.readlink(path))
+            elif os.path.isdir(path):
+                result[rel] = ("dir", os.stat(path).st_mode & 0o777)
+            else:
+                with open(path, "rb") as fh:
+                    result[rel] = ("file", os.stat(path).st_mode & 0o777, fh.read())
+    return result
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="mymind-test-")
     home = os.path.join(tmp, "home"); os.makedirs(os.path.join(home, ".local", "bin"))
@@ -189,38 +274,77 @@ def main():
     Hostile.origin = f"http://127.0.0.1:{port}"
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-    env = dict(os.environ, HOME=home, XDG_CONFIG_HOME=cfg,
+    # Do not inherit real credentials, API overrides, proxies or desktop sockets.
+    env = dict(HOME=home, XDG_CONFIG_HOME=cfg, PATH=os.defpath,
+               LANG="C.UTF-8", TERM="xterm", NO_PROXY="*",
+               XDG_DATA_HOME=os.path.join(home, ".local/share"),
+               XDG_RUNTIME_DIR=os.path.join(tmp, "runtime"),
                XDG_STATE_HOME=os.path.join(home, ".local/state"),
                XDG_CACHE_HOME=os.path.join(home, ".cache"),
                MYMIND_CREDENTIALS=creds, MYMIND_API_URL=Hostile.origin)
 
-    # ---------------- 1. secret never in argv ----------------
-    print("1. omarchy-mymind-setup: secret handling")
+    # ---------------- 1. public setup and secret handling ----------------
+    print("1. omarchy-mymind setup: dispatch, terminals and secrets")
     shim = os.path.join(tmp, "shim"); os.makedirs(shim)
-    argv_log = os.path.join(tmp, "argv.log")
+    argv_log = os.path.join(tmp, "process.jsonl")
+    gum_log = os.path.join(tmp, "gum.log")
     real_py = shutil.which("python3")
     with open(os.path.join(shim, "python3"), "w") as fh:
-        fh.write(f'#!/bin/sh\nprintf "%s\\n" "$@" >> "{argv_log}"\nexec {real_py} "$@"\n')
+        fh.write(f'''#!{real_py}
+import json, os, stat, sys
+record = {{"argv": sys.argv[1:], "env": dict(os.environ)}}
+for name in ("cmdline", "environ"):
+    with open("/proc/self/" + name, "rb") as source:
+        record[name] = source.read().decode(errors="replace")
+if "/dev/fd/3" in sys.argv:
+    record["fd3_open"] = os.fstat(3).st_size >= 0
+    record["stdin_pipe"] = stat.S_ISFIFO(os.fstat(0).st_mode)
+with open({argv_log!r}, "a") as log:
+    log.write(json.dumps(record) + "\\n")
+os.execv({real_py!r}, [{real_py!r}, *sys.argv[1:]])
+''')
     os.chmod(os.path.join(shim, "python3"), 0o755)
-    # Fake gum first on PATH: `input` echoes a line from stdin, `confirm`
-    # says no, `style` prints. Keeps the scripts non-interactive.
+    # Prompt labels go to stderr, just like real gum's terminal UI. Replies come
+    # from the PTY, not stub arguments/environment (especially the secret).
     with open(os.path.join(shim, "gum"), "w") as fh:
-        fh.write('#!/bin/sh\ncase "$1" in input) IFS= read -r l; printf "%s\\n" "$l";; confirm) exit 1;; *) shift; printf "%s\\n" "$*";; esac\n')
+        fh.write(f'''#!/bin/bash
+printf '%s\\n' "$*" >> {gum_log!r}
+case "$1" in
+  input)
+    shift
+    while (( $# )); do
+      if [[ $1 == --prompt ]]; then printf '%s' "$2" >&2; break; fi
+      shift
+    done
+    IFS= read -r line || exit 1
+    printf '%s\\n' "$line"
+    ;;
+  confirm)
+    printf '%s ' "$2" >&2
+    IFS= read -r answer || exit 1
+    [[ $answer == y || $answer == Y ]]
+    ;;
+  *) shift; printf '%s\\n' "$*" ;;
+esac
+''')
     os.chmod(os.path.join(shim, "gum"), 0o755)
-    path = shim + ":" + os.environ["PATH"]
-    # `omarchy-mymind check` inside setup hits our fake server, which answers /objects.
-    p = subprocess.run([os.path.join(BIN, "omarchy-mymind-setup")], input=f"kid123\n{SECRET_B64}\n",
-                       capture_output=True, text=True, env=dict(env, PATH=path))
-    check("setup exits 0", p.returncode == 0, p.stderr.strip()[-300:])
-    logged = open(argv_log).read() if os.path.exists(argv_log) else ""
-    check("secret absent from every python3 argv", SECRET_B64 not in logged, logged[:200])
-    check("kid present in argv (sanity: shim works)", "kid123" in logged)
-    saved = json.load(open(creds))
-    check("credentials file has correct secret", saved.get("secret") == SECRET_B64 and saved.get("kid") == "kid123")
-    check("credentials file mode 0600", (os.stat(creds).st_mode & 0o777) == 0o600)
+    stubs = os.path.join(tmp, "stubs"); os.makedirs(stubs)
+    for name in ("hyprctl", "omarchy", "omarchy-shell", "omarchy-launch-webapp",
+                 "omarchy-launch-floating-terminal-with-presentation", "xdg-open", "notify-send"):
+        with open(os.path.join(stubs, name), "w") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(stubs, name), 0o755)
+    env["PATH"] = stubs + ":" + shim + ":" + os.defpath
+    public = os.path.join(BIN, "omarchy-mymind")
+    lbin = os.path.join(home, ".local", "bin")
+    command_path = os.path.join(lbin, "omarchy-mymind")
+    bindings = os.path.join(cfg, "hypr", "bindings.lua")
+    menu = os.path.join(cfg, "omarchy", "extensions", "omarchy-menu.jsonc")
+    check("setup helpers are internal", all(not os.path.lexists(os.path.join(BIN, name))
+          for name in ("setup", "omarchy-mymind-setup")))
 
-    def cli(*args, stdin=None, extra_env=None):
-        return subprocess.run([os.path.join(BIN, "omarchy-mymind"), *args], input=stdin, capture_output=True,
+    def cli(*args, stdin="", extra_env=None):
+        return subprocess.run([public, *args], input=stdin, capture_output=True,
                               text=True, env=dict(env, **(extra_env or {})), timeout=120)
 
     def problem(p):
@@ -229,48 +353,273 @@ def main():
         except Exception:
             return {}
 
+    for args in (("--help",), ("setup", "--help")):
+        p = cli(*args)
+        check("CLI help: " + " ".join(args), p.returncode == 0 and p.stdout.startswith("usage: omarchy-mymind "))
+        check("help advertises setup options", "setup" in p.stdout and
+              (len(args) == 1 or all(flag in p.stdout for flag in ("--credentials", "--uninstall", "--yes", "-y"))))
+
+    # Probe execv without executing any helper, through a differently named link
+    # and from a foreign cwd. No implementation-specific handler name is assumed.
+    invocation_link = os.path.join(tmp, "public-link")
+    os.symlink(os.path.relpath(public, tmp), invocation_link)
+    dispatch_probe = '''
+import json, os, runpy, sys
+from unittest.mock import patch
+class Executed(BaseException):
+    pass
+def execv(path, argv):
+    print(json.dumps({"path": path, "argv": argv}))
+    raise Executed()
+sys.argv = sys.argv[1:]
+with patch("os.execv", side_effect=execv):
+    try:
+        runpy.run_path(sys.argv[0], run_name="__main__")
+    except Executed:
+        pass
+'''
+    for entry in (public, invocation_link):
+        for flags, helper, delegated in (
+                ((), "setup", []), (("--yes",), "setup", ["--yes"]),
+                (("-y",), "setup", ["--yes"]),
+                (("--uninstall",), "setup", ["--uninstall"]),
+                (("--uninstall", "--yes"), "setup", ["--uninstall", "--yes"]),
+                (("--credentials",), "credentials", []),
+                (("--credentials", "--yes"), "credentials", []),
+                (("--credentials", "-y"), "credentials", [])):
+            p = subprocess.run([real_py, "-c", dispatch_probe, entry, "setup", *flags],
+                               capture_output=True, text=True, env=env, cwd=tmp, timeout=15)
+            result = problem(p)
+            argv = result.get("argv", [])
+            check("execv dispatch " + os.path.basename(entry) + " setup " + " ".join(flags),
+                  p.returncode == 0 and result.get("path") == "/bin/bash" and
+                  argv[:2] == ["/bin/bash", os.path.join(ROOT, "libexec", helper)] and
+                  sorted(argv[2:]) == sorted(delegated), p.stderr[-200:])
+
+    # Real exec, not just a mock: non-executable helpers must run under bash,
+    # inherit both output streams and stdin, and retain arbitrary exit statuses.
+    fixture = os.path.join(tmp, "repo with spaces")
+    os.makedirs(os.path.join(fixture, "bin"))
+    os.makedirs(os.path.join(fixture, "libexec"))
+    fixture_cli = os.path.join(fixture, "bin", "omarchy-mymind")
+    shutil.copy2(public, fixture_cli)
+    fixture_link = os.path.join(tmp, "fixture-link")
+    os.symlink(os.path.relpath(fixture_cli, tmp), fixture_link)
+    for helper in ("setup", "credentials"):
+        with open(os.path.join(fixture, "libexec", helper), "w") as fh:
+            fh.write('[[ -n $BASH_VERSION ]] || exit 99\n'
+                     'IFS= read -r value\nprintf "stdout:%s\\n" "$value"\n'
+                     'printf "stderr:inherited\\n" >&2\nexit 37\n')
+    for entry in (fixture_cli, fixture_link):
+        for flags in ((), ("--credentials",), ("--uninstall",)):
+            p = subprocess.run([entry, "setup", *flags], input="stdio sentinel\n", capture_output=True,
+                               text=True, env=env, cwd=tmp, timeout=15)
+            check("bash delegation preserves stdio/exit: " + os.path.basename(entry) + " " + " ".join(flags),
+                  p.returncode == 37 and p.stdout == "stdout:stdio sentinel\n" and p.stderr == "stderr:inherited\n")
+
+    before = snapshot(home)
+    for flags in (("--credentials", "--uninstall"), ("--uninstall", "--credentials", "--yes"),
+                  ("--unknown",)):
+        p = cli("setup", *flags)
+        check("argparse rejects " + " ".join(flags), p.returncode == 2 and "usage:" in p.stderr and "error:" in p.stderr)
+        check("invalid flags make no edits", snapshot(home) == before)
+
+    # Exercise neither, stdin-only and stdout-only terminals. The public entry
+    # point and helper must reject redirection before creating even a symlink.
+    for flags in ((), ("--credentials",), ("--credentials", "--yes"), ("--yes",), ("-y",)):
+        for terminal in ("neither", "stdin", "stdout"):
+            master, slave = pty.openpty()
+            try:
+                p = subprocess.run([public, "setup", *flags],
+                                   stdin=slave if terminal == "stdin" else subprocess.DEVNULL,
+                                   stdout=slave if terminal == "stdout" else subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, env=env, timeout=15)
+                check("missing terminal rejected: " + " ".join(flags) + " tty=" + terminal,
+                      p.returncode == 1 and any(word in p.stderr.lower() for word in ("terminal", "tty", "interactive"))
+                      and "Traceback" not in p.stderr, p.stderr[-200:])
+                check("terminal rejection occurs before edits", snapshot(home) == before)
+            finally:
+                os.close(master); os.close(slave)
+
+    # `check` inside credentials setup only reaches our loopback mock API.
+    p = terminal_run([public, "setup", "--credentials"], env,
+                     (("kid > ", "kid123"), ("secret > ", SECRET_B64)))
+    check("direct credentials setup exits 0", p.returncode == 0)
+    saved = json.load(open(creds)) if os.path.isfile(creds) else {}
+    check("credentials file has correct secret", saved.get("secret") == SECRET_B64 and saved.get("kid") == "kid123")
+    check("credentials file mode 0600", os.path.isfile(creds) and (os.stat(creds).st_mode & 0o777) == 0o600)
+    check("credentials mode creates no integration files", not any(os.path.lexists(p) for p in (command_path, bindings, menu))
+          and os.listdir(lbin) == [])
+
+    logged = open(argv_log).read() if os.path.exists(argv_log) else ""
+    records = [json.loads(line) for line in logged.splitlines()]
+    check("secret absent from Python argv, environment and /proc", SECRET_B64 not in logged)
+    check("process shim observed /proc cmdline and environ", bool(records) and
+          all("cmdline" in r and "environ" in r for r in records))
+    check("credential writer uses fd3 script and secret pipe", any(
+        r["argv"] == ["/dev/fd/3", creds, "kid123"] and r.get("fd3_open") and r.get("stdin_pipe") for r in records))
+    check("kid present in process log (shim sanity)", "kid123" in logged)
+
+    # A symlink invocation still locates libexec under the real repository root.
+    before = snapshot(home)
+    for flag in ("--yes", "-y"):
+        p = terminal_run([invocation_link, "setup", "--credentials", flag], env, (("Replace them?", "n"),))
+        check("credentials " + flag + " still confirms replacement; decline exits 0", p.returncode == 0)
+        check("declining replacement leaves files and permissions unchanged", snapshot(home) == before)
+
+    p = cli("setup")
+    check("full setup with credentials still requires terminal without --yes", p.returncode == 1 and
+          any(word in p.stderr.lower() for word in ("terminal", "tty", "interactive")))
+    check("full setup terminal rejection makes no edits", snapshot(home) == before)
+    p = cli("setup", "--credentials", "--yes")
+    check("replacement with --yes still requires terminal", p.returncode == 1)
+    check("non-terminal replacement leaves credentials unchanged", snapshot(home) == before)
+
+    # A curated PATH makes gum genuinely unavailable even when installed on the
+    # developer's machine. Bash read must support both input and replacement.
+    plain = os.path.join(tmp, "plain"); os.makedirs(plain)
+    for name in ("bash", "dirname", "mkdir", "chmod", "readlink", "realpath"):
+        os.symlink(shutil.which(name), os.path.join(plain, name))
+    os.symlink(os.path.join(shim, "python3"), os.path.join(plain, "python3"))
+    plain_creds = os.path.join(cfg, "mymind", "plain.json")
+    plain_env = dict(env, PATH=plain, MYMIND_CREDENTIALS=plain_creds)
+    p = terminal_run([invocation_link, "setup", "--credentials", "--yes"], plain_env,
+                     (("kid > ", "plain-kid"), ("secret > ", SECRET_B64)))
+    check("plain bash read credentials setup works through symlink", p.returncode == 0)
+    plain_saved = json.load(open(plain_creds)) if os.path.isfile(plain_creds) else {}
+    check("plain read saves secret with 0600 permissions", plain_saved == {"kid": "plain-kid", "secret": SECRET_B64}
+          and (os.stat(plain_creds).st_mode & 0o777) == 0o600)
+    before = snapshot(home)
+    p = terminal_run([public, "setup", "--credentials", "--yes"], plain_env, (("Replace them?", "n"),))
+    check("plain read replacement decline succeeds without edits", p.returncode == 0 and snapshot(home) == before)
+    check("plain credentials creates no integration files", not any(os.path.lexists(p) for p in (command_path, bindings, menu)))
+    logged = open(argv_log).read() if os.path.exists(argv_log) else ""
+    check("plain read secret absent from process argv/environ", SECRET_B64 not in logged)
+
     # ---------------- 2. symlink safety ----------------
-    print("2. bin/setup: symlink handling")
-    stubs = os.path.join(tmp, "stubs"); os.makedirs(stubs)
-    for s in ("hyprctl", "omarchy"):
-        with open(os.path.join(stubs, s), "w") as fh:
-            fh.write("#!/bin/sh\nexit 1\n")
-        os.chmod(os.path.join(stubs, s), 0o755)
-    lbin = os.path.join(home, ".local", "bin")
+    print("2. omarchy-mymind setup: symlink handling and managed integration")
     foreign_abs = os.path.join(tmp, "other-tool"); open(foreign_abs, "w").close()
-    command_path = os.path.join(lbin, "omarchy-mymind")
-    os.symlink(foreign_abs, command_path)                # foreign absolute
-    helper_path = os.path.join(lbin, "omarchy-mymind-setup")
-    os.symlink("../share/other/omarchy-mymind-setup", helper_path)  # relative (also dangling)
-    setup_env = dict(env, PATH=stubs + ":" + path)
-    p = subprocess.run([os.path.join(BIN, "setup"), "--yes"], capture_output=True, text=True, env=setup_env)
-    check("setup --yes exits 0 with foreign links present", p.returncode == 0, p.stderr[-300:])
-    check("foreign absolute link untouched", os.readlink(command_path) == foreign_abs)
-    check("relative/dangling link untouched", os.readlink(helper_path) == "../share/other/omarchy-mymind-setup")
-    p = subprocess.run([os.path.join(BIN, "setup"), "--uninstall"], capture_output=True, text=True, env=setup_env)
-    check("uninstall exits 0", p.returncode == 0, p.stderr[-300:])
-    check("uninstall leaves foreign absolute link", os.path.islink(command_path))
-    check("uninstall leaves relative/dangling link", os.path.islink(helper_path))
-    # dangling absolute link
-    os.remove(command_path); os.remove(helper_path)
-    os.symlink(os.path.join(tmp, "does-not-exist"), command_path)
-    subprocess.run([os.path.join(BIN, "setup"), "--yes"], capture_output=True, text=True, env=setup_env)
-    check("dangling absolute link untouched", os.readlink(command_path) == os.path.join(tmp, "does-not-exist"))
-    check("free name gets linked", os.readlink(helper_path) == os.path.join(BIN, "omarchy-mymind-setup"))
-    os.remove(command_path); os.remove(helper_path)
+    for label, target in (("foreign absolute", foreign_abs),
+                          ("relative dangling", "../share/other/omarchy-mymind"),
+                          ("relative to our executable", os.path.relpath(public, lbin)),
+                          ("dangling absolute", os.path.join(tmp, "does-not-exist"))):
+        os.symlink(target, command_path)
+        for flags in (("--yes",), ("--uninstall",)):
+            p = cli("setup", *flags)
+            check(label + " setup " + " ".join(flags) + " exits 0", p.returncode == 0, p.stderr[-300:])
+            check(label + " untouched by " + " ".join(flags), os.path.islink(command_path) and os.readlink(command_path) == target)
+            check("only the public command name installed", os.listdir(lbin) == ["omarchy-mymind"])
+        os.remove(command_path)
+
     # regular file (not a link) with our name
     with open(command_path, "w") as fh: fh.write("#!/bin/sh\necho other\n")
-    subprocess.run([os.path.join(BIN, "setup"), "--yes"], capture_output=True, text=True, env=setup_env)
-    check("regular file untouched on install", not os.path.islink(command_path) and open(command_path).read().endswith("echo other\n"))
-    subprocess.run([os.path.join(BIN, "setup"), "--uninstall"], capture_output=True, text=True, env=setup_env)
-    check("regular file untouched on uninstall", os.path.isfile(command_path) and not os.path.islink(command_path))
+    for flags in (("--yes",), ("--uninstall",)):
+        p = cli("setup", *flags)
+        check("regular file untouched by " + " ".join(flags), p.returncode == 0 and not os.path.islink(command_path)
+              and open(command_path).read() == "#!/bin/sh\necho other\n")
     os.remove(command_path)
-    subprocess.run([os.path.join(BIN, "setup"), "--yes"], capture_output=True, text=True, env=setup_env)
-    check("our links created when free", os.readlink(command_path) == os.path.join(BIN, "omarchy-mymind"))
-    p = subprocess.run([command_path, "--help"], capture_output=True, text=True, env=setup_env)
+
+    # Preserve unrelated content before and after the marked integration blocks.
+    os.makedirs(os.path.dirname(bindings), exist_ok=True)
+    os.makedirs(os.path.dirname(menu), exist_ok=True)
+    with open(bindings, "w") as fh:
+        fh.write('-- user binding before\no.bind("SUPER + Z", "User", "user-command")\n')
+    with open(menu, "w") as fh:
+        fh.write('{\n  // user menu before\n  "user.entry": {"label":"Keep me"},\n}\n')
+    creds_before = snapshot(os.path.dirname(creds))
+    gum_before = open(gum_log).read()
+    p = cli("setup", "--yes")
+    check("full setup --yes with existing credentials works without terminal", p.returncode == 0, p.stderr[-300:])
+    check("--yes skips integration confirmations", not any(line.startswith("confirm ")
+          for line in open(gum_log).read()[len(gum_before):].splitlines()))
+    check("only public symlink created when free", os.listdir(lbin) == ["omarchy-mymind"] and
+          os.path.islink(command_path) and os.readlink(command_path) == public)
+    for file, suffix in ((bindings, "-- user binding after\n"), (menu, "// user menu after\n")):
+        with open(file, "a") as fh:
+            fh.write(suffix)
+
+    p = subprocess.run([command_path, "--help"], capture_output=True, text=True, env=env, timeout=15)
     check("installed CLI help uses command name", p.returncode == 0 and p.stdout.startswith("usage: omarchy-mymind "))
-    p = subprocess.run([os.path.join(BIN, "setup"), "--uninstall"], capture_output=True, text=True, env=setup_env)
-    check("uninstall removes exactly our links", not os.path.lexists(command_path) and not os.path.lexists(helper_path))
+    for flag in ("-y", "--yes", "--yes"):
+        p = subprocess.run([command_path, "setup", flag], input="", capture_output=True, text=True,
+                           env=env, cwd=tmp, timeout=15)
+        check("repeated full setup through installed symlink " + flag, p.returncode == 0, p.stderr[-300:])
+        binding_text = open(bindings).read()
+        menu_text = open(menu).read()
+        for label, text in (("bindings", binding_text), ("menu", menu_text)):
+            check(label + " has exactly one managed block", text.count("BEGIN omarchy-mymind") == 1 and
+                  text.count("END omarchy-mymind") == 1)
+        check("exactly three managed keybindings", all(binding_text.count(key) == 1 for key in
+              ('SUPER + ALT + PERIOD', 'SUPER + ALT + M', 'SUPER + ALT + N')))
+        check("menu entries not duplicated", all(menu_text.count('"' + key + '":') == 1 for key in
+              ("trigger.mymind", "trigger.mymind.search", "trigger.mymind.save-clipboard", "trigger.mymind.note",
+               "trigger.mymind.open", "setup.mymind")))
+        check("menu uses unified credential command", "omarchy-mymind setup --credentials" in menu_text and
+              "omarchy-mymind-setup" not in menu_text)
+        check("full --yes never replaces credentials", snapshot(os.path.dirname(creds)) == creds_before)
+
+    p = subprocess.run([command_path, "setup", "--uninstall"], input="", capture_output=True,
+                       text=True, env=env, cwd=tmp, timeout=15)
+    check("uninstall through installed symlink works without terminal", p.returncode == 0, p.stderr[-300:])
+    check("uninstall removes exactly our public link", os.listdir(lbin) == [])
+    for file, expected in ((bindings, ('-- user binding before', 'o.bind("SUPER + Z", "User", "user-command")', '-- user binding after')),
+                           (menu, ('// user menu before', '"user.entry": {"label":"Keep me"},', '// user menu after'))):
+        text = open(file).read()
+        check("uninstall preserves outside markers: " + os.path.basename(file), all(line in text for line in expected) and
+              "omarchy-mymind" not in text and "trigger.mymind" not in text and "setup.mymind" not in text)
+    check("uninstall preserves credentials and permissions", snapshot(os.path.dirname(creds)) == creds_before)
+    before = snapshot(home)
+    p = cli("setup", "--uninstall", "--yes")
+    check("repeated uninstall with --yes is harmless", p.returncode == 0 and snapshot(home) == before)
+
+    # The menu parses the action once, then the terminal wrapper joins $* and
+    # parses it again with bash -c. Do not launch a terminal or any desktop UI.
+    menu_home = os.path.join(tmp, "menu-home")
+    os.makedirs(menu_home)
+    menu_env = dict(env, HOME=menu_home, XDG_CONFIG_HOME=os.path.join(menu_home, ".config"))
+    launcher = '''
+omarchy-launch-floating-terminal-with-presentation() {
+    cmd="$*"
+    /bin/bash -c "$cmd"
+}
+'''
+    for dirname in ("menu repo with spaces",
+                    "menu repo $(touch dollar-evaluated) `touch backtick-evaluated` ' \" \\ ; &"):
+        menu_fixture = os.path.join(tmp, dirname)
+        os.makedirs(os.path.join(menu_fixture, "bin"))
+        os.makedirs(os.path.join(menu_fixture, "libexec"))
+        menu_setup = os.path.join(menu_fixture, "libexec", "setup")
+        shutil.copy2(os.path.join(ROOT, "libexec", "setup"), menu_setup)
+        shutil.copy2(os.path.join(ROOT, "manifest.json"), menu_fixture)
+        menu_cli = os.path.join(menu_fixture, "bin", "omarchy-mymind")
+        with open(menu_cli, "w") as fh:
+            fh.write(f"#!{real_py}\nimport json, sys\nprint(json.dumps(sys.argv))\n")
+        os.chmod(menu_cli, 0o755)
+        p = subprocess.run(["/bin/bash", menu_setup, "--yes"], input="", capture_output=True,
+                           text=True, env=menu_env, cwd=menu_home, timeout=15)
+        check("menu fixture setup succeeds: " + dirname, p.returncode == 0, p.stderr[-300:])
+        generated_menu = os.path.join(menu_env["XDG_CONFIG_HOME"], "omarchy", "extensions", "omarchy-menu.jsonc")
+        with open(generated_menu) as fh:
+            entry = next(line.strip().removesuffix(",") for line in fh
+                         if line.lstrip().startswith('"setup.mymind":'))
+        try:
+            action = json.loads("{" + entry + "}")["setup.mymind"]["action"]
+        except (ValueError, KeyError, TypeError):
+            action = None
+        check("menu action is correctly JSON encoded: " + dirname, isinstance(action, str))
+        if isinstance(action, str):
+            # Avoid login shells: they could restore the real desktop PATH.
+            p = subprocess.run(["/bin/bash", "-c", launcher + action], input="", capture_output=True,
+                               text=True, env=menu_env, cwd=menu_home, timeout=15)
+            try:
+                received = json.loads(p.stdout)
+            except ValueError:
+                received = None
+            check("both menu shell layers preserve exact argv: " + dirname,
+                  p.returncode == 0 and received == [menu_cli, "setup", "--credentials"], p.stderr[-300:])
+        check("menu path substitutions never execute: " + dirname,
+              not any(os.path.lexists(os.path.join(menu_home, name))
+                      for name in ("dollar-evaluated", "backtick-evaluated")))
 
     # ---------------- 1b. note body via stdin ----------------
     print("1b. omarchy-mymind: note bodies over stdin")
@@ -337,10 +686,38 @@ def main():
     check("no partial cache files left", not leftovers, str(leftovers))
     check("only the 2 good thumbnails cached", len(os.listdir(cache)) == 2, str(os.listdir(cache)))
 
-    # allow-list override for mock CDNs
-    p = cli("thumbnail", "redir-offdomain", extra_env={"MYMIND_THUMBNAIL_HOSTS": "evil.example.com"})
-    check("MYMIND_THUMBNAIL_HOSTS override reaches validation (network error, not BadResponse)",
-          problem(p).get("type") == "Network", p.stdout[-200:])
+    # Test CDN allow-list overrides without DNS or an external connection. The
+    # socket guards also make an accidental future network call fail offline.
+    probe = '''
+import os, runpy, sys
+from unittest.mock import patch
+with patch("socket.socket.connect", side_effect=AssertionError("network forbidden")), \
+     patch("socket.getaddrinfo", side_effect=AssertionError("DNS forbidden")):
+    module = runpy.run_path(sys.argv[1])
+    validate = module["validate_download_url"]
+    error = module["MymindError"]
+    url = "https://evil.example.com/x.png"
+    try:
+        validate(url)
+    except error as exc:
+        assert exc.problem["type"] == "BadResponse"
+    else:
+        raise AssertionError("off-domain URL accepted without override")
+    os.environ["MYMIND_THUMBNAIL_HOSTS"] = "evil.example.com"
+    assert validate(url) == url
+    for url in ("http://evil.example.com/x.png", "https://evil.example.com:8443/x.png",
+                "https://evil.example.com@other.example/x.png"):
+        try:
+            validate(url)
+        except error as exc:
+            assert exc.problem["type"] == "BadResponse"
+        else:
+            raise AssertionError("override bypasses scheme/port/userinfo validation")
+print("offline allowlist probe passed")
+'''
+    p = subprocess.run([real_py, "-c", probe, public], capture_output=True, text=True, env=env, timeout=15)
+    check("MYMIND_THUMBNAIL_HOSTS override validated entirely offline",
+          p.returncode == 0 and "offline allowlist probe passed" in p.stdout, p.stderr[-300:])
 
     srv.shutdown()
     shutil.rmtree(tmp, ignore_errors=True)

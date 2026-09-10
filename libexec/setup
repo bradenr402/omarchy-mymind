@@ -1,14 +1,14 @@
 #!/bin/bash
-# setup — one-shot setup for the mymind Omarchy plugin.
+# Internal integration installer, invoked by omarchy-mymind setup.
 #
 #   setup              interactive: does everything below, asking before each step
-#   setup --yes        non-interactive, accept all defaults
-#   setup --uninstall  remove the CLI symlinks, keybindings and menu entries this
+#   setup --yes        accept integration defaults (credentials still interactive)
+#   setup --uninstall  remove the CLI symlink, keybindings and menu entries this
 #                      script added (credentials are left alone)
 #
 # Steps:
-#   1. Put `omarchy-mymind` and `omarchy-mymind-setup` on PATH (~/.local/bin symlinks)
-#   2. Store your mymind access key (runs omarchy-mymind-setup) if not already done
+#   1. Put `omarchy-mymind` on PATH (~/.local/bin symlink)
+#   2. Store your mymind access key (setup --credentials) if not already done
 #   3. Add keybindings to ~/.config/hypr/bindings.lua
 #   4. Add a Trigger > mymind submenu and a Setup entry to the Omarchy menu
 #   5. Make sure the plugin is enabled with the bar widget placed
@@ -18,8 +18,8 @@
 
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLUGIN_DIR="$(dirname "$HERE")"
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HERE="$PLUGIN_DIR/bin"
 PLUGIN_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$PLUGIN_DIR/manifest.json")"
 
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -28,9 +28,9 @@ BINDINGS="$CONFIG/hypr/bindings.lua"
 MENU="$CONFIG/omarchy/extensions/omarchy-menu.jsonc"
 CREDS="${MYMIND_CREDENTIALS:-$CONFIG/mymind/credentials.json}"
 
-BEGIN="-- BEGIN omarchy-mymind (managed by bin/setup)"
+BEGIN="-- BEGIN omarchy-mymind (managed by omarchy-mymind setup)"
 END="-- END omarchy-mymind"
-JBEGIN="  // BEGIN omarchy-mymind (managed by bin/setup)"
+JBEGIN="  // BEGIN omarchy-mymind (managed by omarchy-mymind setup)"
 JEND="  // END omarchy-mymind"
 
 YES=false
@@ -43,6 +43,12 @@ for a in "$@"; do
     *) echo "unknown option: $a" >&2; exit 1 ;;
   esac
 done
+
+# Fail before changing integration when the requested prompts cannot be shown.
+if ! $UNINSTALL && { ! $YES || [[ ! -f $CREDS ]]; } && { [[ ! -t 0 ]] || [[ ! -t 1 ]]; }; then
+  echo "Setup requires an interactive terminal. Use --yes only when credentials already exist." >&2
+  exit 1
+fi
 
 have_gum() { command -v gum >/dev/null 2>&1; }
 info() { if have_gum; then gum style --foreground 212 "$*"; else echo "== $*"; fi; }
@@ -84,7 +90,7 @@ $JBEGIN
   "trigger.mymind.save-clipboard": {"icon":"󰆒","label":"Save Clipboard","description":"URL, text or image","action":"$(summon summon save esc)"},
   "trigger.mymind.note": {"icon":"󰎞","label":"New Note","action":"$(summon summon note esc)"},
   "trigger.mymind.open": {"icon":"󰏌","label":"Open mymind","action":"omarchy-launch-webapp https://access.mymind.com"},
-  "setup.mymind": {"icon":"󰌆","label":"mymind Access Key","description":"Store your mymind API key","action":"omarchy-launch-floating-terminal-with-presentation $PLUGIN_DIR/bin/omarchy-mymind-setup"},
+  "setup.mymind": {"icon":"󰌆","label":"mymind Access Key","description":"Store your mymind API key","action":$(python3 -c 'import json,shlex,sys; cmd = shlex.quote(sys.argv[1]) + " setup --credentials"; print(json.dumps("omarchy-launch-floating-terminal-with-presentation " + shlex.quote(cmd)))' "$HERE/omarchy-mymind")},
 $JEND
 EOF
 }
@@ -118,7 +124,7 @@ ours() { # link name
 
 if $UNINSTALL; then
   info "Removing omarchy-mymind integration"
-  for b in omarchy-mymind omarchy-mymind-setup; do
+  for b in omarchy-mymind; do
     if ours "$BIN_DIR/$b" "$b"; then
       rm -- "$BIN_DIR/$b"; ok "removed $BIN_DIR/$b"
     elif [[ -e $BIN_DIR/$b || -L $BIN_DIR/$b ]]; then
@@ -147,7 +153,7 @@ echo
 # 1. CLI on PATH
 info "1/5 Command-line tools"
 mkdir -p "$BIN_DIR"
-for b in omarchy-mymind omarchy-mymind-setup; do
+for b in omarchy-mymind; do
   target="$BIN_DIR/$b"
   if ours "$target" "$b"; then
     skip "$target already linked"
@@ -171,9 +177,9 @@ info "2/5 Access key"
 if [[ -f $CREDS ]]; then
   skip "credentials already at $CREDS"
 elif confirm "Store your mymind access key now?"; then
-  "$HERE/omarchy-mymind-setup"
+  "$HERE/omarchy-mymind" setup --credentials
 else
-  skip "skipped; run omarchy-mymind-setup later (or Setup > mymind Access Key in the menu)"
+  skip "skipped; run omarchy-mymind setup --credentials later (or Setup > mymind Access Key in the menu)"
 fi
 echo
 

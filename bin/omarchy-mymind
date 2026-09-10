@@ -3,6 +3,7 @@
 
 Used by the Omarchy shell plugin (bradenr402.mymind), but also usable directly:
 
+    omarchy-mymind setup [--credentials | --uninstall] [--yes]
     omarchy-mymind check
     omarchy-mymind search "design tools" [--semantic] [--limit 20]
     omarchy-mymind save-url https://example.com [--title T] [--tag t]... [--note MD] [--space ID]...
@@ -16,11 +17,12 @@ Used by the Omarchy shell plugin (bradenr402.mymind), but also usable directly:
     omarchy-mymind thumbnail <id> [--size 96x96]
     omarchy-mymind open <id>
 
-Every command prints a single JSON document on stdout. Errors print a JSON
+API commands print a single JSON document on stdout. Errors print a JSON
 problem object on stdout AND a short message on stderr, and exit non-zero.
+Setup is interactive and prints human-readable output instead.
 
 Credentials: ~/.config/mymind/credentials.json  ({"kid": "...", "secret": "..."})
-Created by `omarchy-mymind-setup`. Must be mode 0600.
+Created by `omarchy-mymind setup --credentials`. Must be mode 0600.
 """
 
 from __future__ import annotations
@@ -118,7 +120,7 @@ def load_credentials() -> tuple[str, str]:
     if not os.path.exists(path):
         raise MymindError(
             "NotConfigured",
-            f"No credentials at {path}. Run `omarchy-mymind-setup` to add your access key.",
+            f"No credentials at {path}. Run `omarchy-mymind setup --credentials` to add your access key.",
         )
     mode = stat.S_IMODE(os.stat(path).st_mode)
     if mode & 0o077:
@@ -855,6 +857,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    p = sub.add_parser("setup", help="configure credentials and desktop integration (interactive)",
+                       description="Set up PATH, credentials, keybindings, menu entries and plugin enablement. Prints human-readable output.")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--credentials", action="store_true", help="only create or replace the access key; always prompts")
+    mode.add_argument("--uninstall", action="store_true", help="remove integration only; keep credentials, caches and plugin files")
+    p.add_argument("--yes", "-y", action="store_true", help="accept integration defaults; credential entry/replacement still requires a terminal")
+
     sub.add_parser("check", help="validate credentials and show quota").set_defaults(fn=cmd_check)
 
     p = sub.add_parser("search", help="search objects")
@@ -924,6 +933,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.cmd == "setup":
+        plugin_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        script = os.path.join(plugin_dir, "libexec", "credentials" if args.credentials else "setup")
+        flags = []
+        if not args.credentials:
+            if args.uninstall:
+                flags.append("--uninstall")
+            if args.yes:
+                flags.append("--yes")
+        try:
+            # Replace the CLI so prompts inherit the terminal and exits/signals propagate.
+            os.execv("/bin/bash", ["/bin/bash", script, *flags])
+        except OSError as exc:
+            print(f"omarchy-mymind: Could not start setup: {exc}", file=sys.stderr)
+            return 1
     try:
         result = args.fn(args)
     except MymindError as exc:

@@ -118,7 +118,7 @@ Item {
 
   function describeError(res) {
     if (!res) return "Unknown error"
-    if (res.type === "NotConfigured") return "No access key. Run `omarchy-mymind-setup` in a terminal."
+    if (res.type === "NotConfigured") return "No access key. Run `omarchy-mymind setup --credentials` in a terminal."
     if (res.type === "RateLimited") return "Rate limited — retry in " + (res.retryAfter || "?") + "s"
     return (res.type ? res.type + ": " : "") + (res.detail || "failed")
   }
