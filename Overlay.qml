@@ -22,7 +22,7 @@ Item {
   property var manifest: null
 
   readonly property string pluginId: (manifest && manifest.id) || "bradenr402.mymind"
-  readonly property string cli: String(Qt.resolvedUrl("bin/mymind")).replace(/^file:\/\//, "")
+  readonly property string cli: String(Qt.resolvedUrl("bin/omarchy-mymind")).replace(/^file:\/\//, "")
 
   property bool opened: false
   property string mode: "search"
@@ -118,7 +118,7 @@ Item {
 
   function describeError(res) {
     if (!res) return "Unknown error"
-    if (res.type === "NotConfigured") return "No access key. Run `mymind-setup` in a terminal."
+    if (res.type === "NotConfigured") return "No access key. Run `omarchy-mymind-setup` in a terminal."
     if (res.type === "RateLimited") return "Rate limited — retry in " + (res.retryAfter || "?") + "s"
     return (res.type ? res.type + ": " : "") + (res.detail || "failed")
   }

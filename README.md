@@ -21,18 +21,18 @@ Plugin id: `bradenr402.mymind`
 ## Layout
 
 ```
-manifest.json      Omarchy plugin manifest (overlay + bar-widget)
-Overlay.qml        The overlay UI (all modes)
-BarWidget.qml      Bar icon + IPC handler
-bin/mymind         Python 3 (stdlib only) API client: JWT signing, requests, 429 back-off
-bin/setup          One-shot setup: PATH symlinks, access key, keybindings, menu entries
-bin/mymind-setup   Access-key prompt only (writes ~/.config/mymind/credentials.json, 0600)
-bin/dev-install    Copies the working tree into ~/.config/omarchy/plugins/ and restarts the shell
-test/mock_api.py   Fake API server for UI testing without spending credits
-test/test_security.py  Offline regression tests for the security properties
+manifest.json             Omarchy plugin manifest (overlay + bar-widget)
+Overlay.qml               The overlay UI (all modes)
+BarWidget.qml             Bar icon + IPC handler
+bin/omarchy-mymind         Python 3 (stdlib only) API client: JWT signing, requests, 429 back-off
+bin/setup                 One-shot setup: PATH symlinks, access key, keybindings, menu entries
+bin/omarchy-mymind-setup   Access-key prompt only (writes ~/.config/mymind/credentials.json, 0600)
+bin/dev-install           Copies the working tree into ~/.config/omarchy/plugins/ and restarts the shell
+test/mock_api.py          Fake API server for UI testing without spending credits
+test/test_security.py     Offline regression tests for the security properties
 ```
 
-The QML never touches the network itself; it shells out to `bin/mymind`, which
+The QML never touches the network itself; it shells out to `bin/omarchy-mymind`, which
 prints one JSON document per call. That keeps secrets in one place and makes
 the CLI useful on its own.
 
@@ -45,7 +45,7 @@ omarchy plugin add https://github.com/bradenr402/omarchy-mymind.git --enable
 
 `setup` walks you through the rest, asking before each step:
 
-1. Puts the `mymind` and `mymind-setup` commands on your PATH (`~/.local/bin`).
+1. Puts the `omarchy-mymind` and `omarchy-mymind-setup` commands on your PATH (`~/.local/bin`).
 2. Stores your access key (see below) if you haven't already.
 3. Adds keybindings to `~/.config/hypr/bindings.lua`:
    `Super+Alt+.` search, `Super+Alt+M` save clipboard, `Super+Alt+N` new note.
@@ -69,7 +69,7 @@ every response body is capped (8 MiB JSON/images, 64 KiB errors, 60 s per body).
 ### Access key
 
 Create a key at <https://access.mymind.com/extensions> with **Full access**
-(saving needs write); the secret is shown once. `setup` (or `mymind-setup` on
+(saving needs write); the secret is shown once. `setup` (or `omarchy-mymind-setup` on
 its own) stores it in `~/.config/mymind/credentials.json` with mode `0600` and
 verifies it with a 1-credit request.
 
@@ -96,23 +96,23 @@ IPC shortcuts via the bar widget: `omarchy-shell bradenr402.mymind search|save|n
 ## CLI
 
 ```
-mymind check
-mymind search "design tools" [--semantic] [--limit 20]
-mymind save-url <url> [--title T] [--tag t]... [--note MD] [--space ID]...
-mymind save-note "<markdown>"          # or via stdin
-mymind save-file <path>
-mymind save-clipboard
-mymind spaces
-mymind add-tags <id> tag [tag...]
-mymind add-note <id> "<markdown>"
-mymind add-to-space <id> <spaceId>
-mymind thumbnail <id> [--size 96x96]
-mymind open <id> [--app]
+omarchy-mymind check
+omarchy-mymind search "design tools" [--semantic] [--limit 20]
+omarchy-mymind save-url <url> [--title T] [--tag t]... [--note MD] [--space ID]...
+omarchy-mymind save-note "<markdown>"          # or via stdin
+omarchy-mymind save-file <path>
+omarchy-mymind save-clipboard
+omarchy-mymind spaces
+omarchy-mymind add-tags <id> tag [tag...]
+omarchy-mymind add-note <id> "<markdown>"
+omarchy-mymind add-to-space <id> <spaceId>
+omarchy-mymind thumbnail <id> [--size 96x96]
+omarchy-mymind open <id> [--app]
 ```
 
 Rate limits: after a `429` the CLI records the reset time in
 `~/.local/state/omarchy-mymind/backoff.json` and refuses to call the API until
-it passes (`mymind clear-backoff` overrides). Costs are surfaced in the overlay
+it passes (`omarchy-mymind clear-backoff` overrides). Costs are surfaced in the overlay
 footer.
 
 ## Remove

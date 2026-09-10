@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""mymind — a tiny stdlib-only client for the mymind API.
+"""omarchy-mymind — a tiny stdlib-only client for the mymind API.
 
 Used by the Omarchy shell plugin (bradenr402.mymind), but also usable directly:
 
-    mymind check
-    mymind search "design tools" [--semantic] [--limit 20]
-    mymind save-url https://example.com [--title T] [--tag t]... [--note MD] [--space ID]...
-    mymind save-note "# markdown" [--title T] [--tag t]... [--space ID]...
-    mymind save-file ./photo.png [--title T] [--tag t]... [--space ID]...
-    mymind save-clipboard [--tag t]... [--note MD]
-    mymind spaces
-    mymind add-tags <id> tag [tag...]
-    mymind add-note <id> "markdown"
-    mymind add-to-space <id> <spaceId>
-    mymind thumbnail <id> [--size 96x96]
-    mymind open <id>
+    omarchy-mymind check
+    omarchy-mymind search "design tools" [--semantic] [--limit 20]
+    omarchy-mymind save-url https://example.com [--title T] [--tag t]... [--note MD] [--space ID]...
+    omarchy-mymind save-note "# markdown" [--title T] [--tag t]... [--space ID]...
+    omarchy-mymind save-file ./photo.png [--title T] [--tag t]... [--space ID]...
+    omarchy-mymind save-clipboard [--tag t]... [--note MD]
+    omarchy-mymind spaces
+    omarchy-mymind add-tags <id> tag [tag...]
+    omarchy-mymind add-note <id> "markdown"
+    omarchy-mymind add-to-space <id> <spaceId>
+    omarchy-mymind thumbnail <id> [--size 96x96]
+    omarchy-mymind open <id>
 
 Every command prints a single JSON document on stdout. Errors print a JSON
 problem object on stdout AND a short message on stderr, and exit non-zero.
 
 Credentials: ~/.config/mymind/credentials.json  ({"kid": "...", "secret": "..."})
-Created by `mymind-setup`. Must be mode 0600.
+Created by `omarchy-mymind-setup`. Must be mode 0600.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import uuid
 def _plugin_version() -> str:
     """Read the version from manifest.json (single source of truth).
 
-    realpath() matters: ~/.local/bin/mymind is a symlink into the plugin dir.
+    realpath() matters: ~/.local/bin/omarchy-mymind links into the plugin dir.
     """
     manifest = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "manifest.json")
     try:
@@ -118,7 +118,7 @@ def load_credentials() -> tuple[str, str]:
     if not os.path.exists(path):
         raise MymindError(
             "NotConfigured",
-            f"No credentials at {path}. Run `mymind-setup` to add your access key.",
+            f"No credentials at {path}. Run `omarchy-mymind-setup` to add your access key.",
         )
     mode = stat.S_IMODE(os.stat(path).st_mode)
     if mode & 0o077:
@@ -851,7 +851,7 @@ def add_meta_flags(p: argparse.ArgumentParser, notes: bool = True):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="mymind", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog="omarchy-mymind", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -929,7 +929,7 @@ def main(argv: list[str] | None = None) -> int:
     except MymindError as exc:
         problem = {"ok": False, **exc.problem}
         print(json.dumps(problem))
-        print(f"mymind: {exc.problem['type']}: {exc.problem['detail']}", file=sys.stderr)
+        print(f"omarchy-mymind: {exc.problem['type']}: {exc.problem['detail']}", file=sys.stderr)
         if exc.problem["type"] == "Cancelled":
             return 3
         if exc.problem["type"] in ("NotConfigured", "InsecureCredentials"):
@@ -940,7 +940,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - stdout must always be one JSON document
         problem = {"ok": False, "type": "Internal", "status": 0, "detail": f"{type(exc).__name__}: {exc}"}
         print(json.dumps(problem))
-        print(f"mymind: Internal: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"omarchy-mymind: Internal: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False))
     return 0

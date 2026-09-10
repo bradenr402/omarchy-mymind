@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Security regression tests for the mymind CLI and setup scripts.
+"""Security regression tests for the omarchy-mymind CLI and setup scripts.
 
     python3 test/test_security.py
 
 Runs entirely offline against throwaway HOME/XDG dirs and a local HTTP server.
 Covers the marketplace review blockers:
 
-  1. mymind-setup never puts the secret in argv (checked via a python3 shim
+  1. omarchy-mymind-setup never puts the secret in argv (checked via a python3 shim
      that records its argv); note bodies are accepted on stdin.
   2. bin/setup refuses to replace foreign / relative / dangling symlinks in
      ~/.local/bin, and --uninstall leaves them untouched.
-  3. bin/mymind bounds every network body (JSON, error, image), rejects
+  3. bin/omarchy-mymind bounds every network body (JSON, error, image), rejects
      oversized / chunked / endless responses, and refuses thumbnail redirects
      to off-domain, loopback, non-https or userinfo URLs.
 """
@@ -195,7 +195,7 @@ def main():
                MYMIND_CREDENTIALS=creds, MYMIND_API_URL=Hostile.origin)
 
     # ---------------- 1. secret never in argv ----------------
-    print("1. mymind-setup: secret handling")
+    print("1. omarchy-mymind-setup: secret handling")
     shim = os.path.join(tmp, "shim"); os.makedirs(shim)
     argv_log = os.path.join(tmp, "argv.log")
     real_py = shutil.which("python3")
@@ -208,8 +208,8 @@ def main():
         fh.write('#!/bin/sh\ncase "$1" in input) IFS= read -r l; printf "%s\\n" "$l";; confirm) exit 1;; *) shift; printf "%s\\n" "$*";; esac\n')
     os.chmod(os.path.join(shim, "gum"), 0o755)
     path = shim + ":" + os.environ["PATH"]
-    # `mymind check` inside setup hits our fake server, which answers /objects.
-    p = subprocess.run([os.path.join(BIN, "mymind-setup")], input=f"kid123\n{SECRET_B64}\n",
+    # `omarchy-mymind check` inside setup hits our fake server, which answers /objects.
+    p = subprocess.run([os.path.join(BIN, "omarchy-mymind-setup")], input=f"kid123\n{SECRET_B64}\n",
                        capture_output=True, text=True, env=dict(env, PATH=path))
     check("setup exits 0", p.returncode == 0, p.stderr.strip()[-300:])
     logged = open(argv_log).read() if os.path.exists(argv_log) else ""
@@ -220,7 +220,7 @@ def main():
     check("credentials file mode 0600", (os.stat(creds).st_mode & 0o777) == 0o600)
 
     def cli(*args, stdin=None, extra_env=None):
-        return subprocess.run([os.path.join(BIN, "mymind"), *args], input=stdin, capture_output=True,
+        return subprocess.run([os.path.join(BIN, "omarchy-mymind"), *args], input=stdin, capture_output=True,
                               text=True, env=dict(env, **(extra_env or {})), timeout=120)
 
     def problem(p):
@@ -238,38 +238,42 @@ def main():
         os.chmod(os.path.join(stubs, s), 0o755)
     lbin = os.path.join(home, ".local", "bin")
     foreign_abs = os.path.join(tmp, "other-tool"); open(foreign_abs, "w").close()
-    os.symlink(foreign_abs, os.path.join(lbin, "mymind"))                # foreign absolute
-    os.symlink("../share/other/mymind-setup", os.path.join(lbin, "mymind-setup"))  # relative (also dangling)
+    command_path = os.path.join(lbin, "omarchy-mymind")
+    os.symlink(foreign_abs, command_path)                # foreign absolute
+    helper_path = os.path.join(lbin, "omarchy-mymind-setup")
+    os.symlink("../share/other/omarchy-mymind-setup", helper_path)  # relative (also dangling)
     setup_env = dict(env, PATH=stubs + ":" + path)
     p = subprocess.run([os.path.join(BIN, "setup"), "--yes"], capture_output=True, text=True, env=setup_env)
     check("setup --yes exits 0 with foreign links present", p.returncode == 0, p.stderr[-300:])
-    check("foreign absolute link untouched", os.readlink(os.path.join(lbin, "mymind")) == foreign_abs)
-    check("relative/dangling link untouched", os.readlink(os.path.join(lbin, "mymind-setup")) == "../share/other/mymind-setup")
+    check("foreign absolute link untouched", os.readlink(command_path) == foreign_abs)
+    check("relative/dangling link untouched", os.readlink(helper_path) == "../share/other/omarchy-mymind-setup")
     p = subprocess.run([os.path.join(BIN, "setup"), "--uninstall"], capture_output=True, text=True, env=setup_env)
     check("uninstall exits 0", p.returncode == 0, p.stderr[-300:])
-    check("uninstall leaves foreign absolute link", os.path.islink(os.path.join(lbin, "mymind")))
-    check("uninstall leaves relative/dangling link", os.path.islink(os.path.join(lbin, "mymind-setup")))
+    check("uninstall leaves foreign absolute link", os.path.islink(command_path))
+    check("uninstall leaves relative/dangling link", os.path.islink(helper_path))
     # dangling absolute link
-    os.remove(os.path.join(lbin, "mymind")); os.remove(os.path.join(lbin, "mymind-setup"))
-    os.symlink(os.path.join(tmp, "does-not-exist"), os.path.join(lbin, "mymind"))
+    os.remove(command_path); os.remove(helper_path)
+    os.symlink(os.path.join(tmp, "does-not-exist"), command_path)
     subprocess.run([os.path.join(BIN, "setup"), "--yes"], capture_output=True, text=True, env=setup_env)
-    check("dangling absolute link untouched", os.readlink(os.path.join(lbin, "mymind")) == os.path.join(tmp, "does-not-exist"))
-    check("free name gets linked", os.readlink(os.path.join(lbin, "mymind-setup")) == os.path.join(BIN, "mymind-setup"))
-    os.remove(os.path.join(lbin, "mymind")); os.remove(os.path.join(lbin, "mymind-setup"))
+    check("dangling absolute link untouched", os.readlink(command_path) == os.path.join(tmp, "does-not-exist"))
+    check("free name gets linked", os.readlink(helper_path) == os.path.join(BIN, "omarchy-mymind-setup"))
+    os.remove(command_path); os.remove(helper_path)
     # regular file (not a link) with our name
-    with open(os.path.join(lbin, "mymind"), "w") as fh: fh.write("#!/bin/sh\necho other\n")
+    with open(command_path, "w") as fh: fh.write("#!/bin/sh\necho other\n")
     subprocess.run([os.path.join(BIN, "setup"), "--yes"], capture_output=True, text=True, env=setup_env)
-    check("regular file untouched on install", not os.path.islink(os.path.join(lbin, "mymind")) and open(os.path.join(lbin, "mymind")).read().endswith("echo other\n"))
+    check("regular file untouched on install", not os.path.islink(command_path) and open(command_path).read().endswith("echo other\n"))
     subprocess.run([os.path.join(BIN, "setup"), "--uninstall"], capture_output=True, text=True, env=setup_env)
-    check("regular file untouched on uninstall", os.path.isfile(os.path.join(lbin, "mymind")) and not os.path.islink(os.path.join(lbin, "mymind")))
-    os.remove(os.path.join(lbin, "mymind"))
+    check("regular file untouched on uninstall", os.path.isfile(command_path) and not os.path.islink(command_path))
+    os.remove(command_path)
     subprocess.run([os.path.join(BIN, "setup"), "--yes"], capture_output=True, text=True, env=setup_env)
-    check("our links created when free", os.readlink(os.path.join(lbin, "mymind")) == os.path.join(BIN, "mymind"))
+    check("our links created when free", os.readlink(command_path) == os.path.join(BIN, "omarchy-mymind"))
+    p = subprocess.run([command_path, "--help"], capture_output=True, text=True, env=setup_env)
+    check("installed CLI help uses command name", p.returncode == 0 and p.stdout.startswith("usage: omarchy-mymind "))
     p = subprocess.run([os.path.join(BIN, "setup"), "--uninstall"], capture_output=True, text=True, env=setup_env)
-    check("uninstall removes exactly our links", not os.path.lexists(os.path.join(lbin, "mymind")) and not os.path.lexists(os.path.join(lbin, "mymind-setup")))
+    check("uninstall removes exactly our links", not os.path.lexists(command_path) and not os.path.lexists(helper_path))
 
     # ---------------- 1b. note body via stdin ----------------
-    print("1b. mymind: note bodies over stdin")
+    print("1b. omarchy-mymind: note bodies over stdin")
     # save-note POST isn't handled by the hostile server, so we just check it reads stdin and gets past validation.
     p = cli("save-note", stdin="   \n")
     check("empty stdin note refused", p.returncode != 0 and problem(p).get("type") == "BadRequest")
@@ -277,7 +281,7 @@ def main():
     check("empty stdin add-note refused", p.returncode != 0 and problem(p).get("type") == "BadRequest")
 
     # ---------------- 3. bounded bodies / redirects ----------------
-    print("3. mymind: bounded reads")
+    print("3. omarchy-mymind: bounded reads")
     p = cli("check")
     check("normal API call works", p.returncode == 0 and problem(p).get("ok") is True, p.stderr[-200:])
 
@@ -290,7 +294,7 @@ def main():
     p = cli("get", "big-error")
     check("oversized error body rejected", problem(p).get("type") == "ResponseTooLarge", p.stdout[-200:])
 
-    print("3. mymind: thumbnails")
+    print("3. omarchy-mymind: thumbnails")
     cache = os.path.join(home, ".cache", "omarchy-mymind", "thumbnails")
     os.makedirs(cache, exist_ok=True)
     p = cli("thumbnail", "direct")
