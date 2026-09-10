@@ -21,7 +21,7 @@ API commands print a single JSON document on stdout. Errors print a JSON
 problem object on stdout AND a short message on stderr, and exit non-zero.
 Setup is interactive and prints human-readable output instead.
 
-Credentials: ~/.config/mymind/credentials.json  ({"kid": "...", "secret": "..."})
+Credentials: ~/.config/omarchy-mymind/credentials.json  ({"kid": "...", "secret": "..."})
 Created by `omarchy-mymind setup --credentials`. Must be mode 0600.
 """
 
@@ -70,7 +70,7 @@ XDG_STATE = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"
 XDG_CACHE = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
 
 CREDENTIALS_PATH = os.environ.get(
-    "MYMIND_CREDENTIALS", os.path.join(XDG_CONFIG, "mymind", "credentials.json")
+    "MYMIND_CREDENTIALS", os.path.join(XDG_CONFIG, "omarchy-mymind", "credentials.json")
 )
 STATE_DIR = os.path.join(XDG_STATE, "omarchy-mymind")
 BACKOFF_PATH = os.path.join(STATE_DIR, "backoff.json")
@@ -861,7 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
                        description="Set up PATH, credentials, keybindings, menu entries and plugin enablement. Prints human-readable output.")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--credentials", action="store_true", help="only create or replace the access key; always prompts")
-    mode.add_argument("--uninstall", action="store_true", help="remove integration only; keep credentials, caches and plugin files")
+    mode.add_argument("--uninstall", action="store_true", help="remove integration; optionally delete credentials after confirmation in a terminal; keep caches and plugin files")
     p.add_argument("--yes", "-y", action="store_true", help="accept integration defaults; credential entry/replacement still requires a terminal")
 
     sub.add_parser("check", help="validate credentials and show quota").set_defaults(fn=cmd_check)

@@ -9,7 +9,7 @@ Covers the marketplace review blockers:
   1. Unified setup dispatch, terminal requirements, and secret handling (including
      /proc cmdline/environ); note bodies are accepted on stdin.
   2. Setup refuses to replace foreign / relative / dangling symlinks in
-     ~/.local/bin, is idempotent, and uninstalls only its managed integration.
+     ~/.local/bin, is idempotent, and deletes credentials only with terminal consent.
   3. bin/omarchy-mymind bounds every network body (JSON, error, image), rejects
      oversized / chunked / endless responses, and refuses thumbnail redirects
      to off-domain, loopback, non-https or userinfo URLs.
@@ -266,8 +266,8 @@ def snapshot(root):
 def main():
     tmp = tempfile.mkdtemp(prefix="mymind-test-")
     home = os.path.join(tmp, "home"); os.makedirs(os.path.join(home, ".local", "bin"))
-    cfg = os.path.join(home, ".config"); os.makedirs(os.path.join(cfg, "mymind"), mode=0o700)
-    creds = os.path.join(cfg, "mymind", "credentials.json")
+    cfg = os.path.join(home, ".config"); os.makedirs(os.path.join(cfg, "omarchy-mymind"), mode=0o700)
+    creds = os.path.join(cfg, "omarchy-mymind", "credentials.json")
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Hostile)
     port = srv.server_address[1]
@@ -481,7 +481,7 @@ with patch("os.execv", side_effect=execv):
     for name in ("bash", "dirname", "mkdir", "chmod", "readlink", "realpath"):
         os.symlink(shutil.which(name), os.path.join(plain, name))
     os.symlink(os.path.join(shim, "python3"), os.path.join(plain, "python3"))
-    plain_creds = os.path.join(cfg, "mymind", "plain.json")
+    plain_creds = os.path.join(cfg, "omarchy-mymind", "plain.json")
     plain_env = dict(env, PATH=plain, MYMIND_CREDENTIALS=plain_creds)
     p = terminal_run([invocation_link, "setup", "--credentials", "--yes"], plain_env,
                      (("kid > ", "plain-kid"), ("secret > ", SECRET_B64)))
@@ -495,6 +495,70 @@ with patch("os.execv", side_effect=execv):
     check("plain credentials creates no integration files", not any(os.path.lexists(p) for p in (command_path, bindings, menu)))
     logged = open(argv_log).read() if os.path.exists(argv_log) else ""
     check("plain read secret absent from process argv/environ", SECRET_B64 not in logged)
+
+    # No override: all entry points must agree, without consulting the old path.
+    print("1a. credential defaults: HOME fallback and XDG_CONFIG_HOME")
+    mock_probe = '''
+import runpy, sys
+from unittest.mock import patch
+with patch("socket.socket.connect", side_effect=AssertionError("network forbidden")), \
+     patch("socket.getaddrinfo", side_effect=AssertionError("DNS forbidden")):
+    module = runpy.run_path(sys.argv[1])
+assert module["CREDS"] == sys.argv[2]
+'''
+    for label in ("HOME fallback", "XDG alternative"):
+        default_home = os.path.join(tmp, label)
+        default_cfg = os.path.join(default_home, ".config" if label == "HOME fallback" else "xdg config")
+        default_creds = os.path.join(default_cfg, "omarchy-mymind", "credentials.json")
+        legacy_creds = os.path.join(default_cfg, "mymind", "credentials.json")
+        os.makedirs(os.path.dirname(legacy_creds))
+        shutil.copy2(creds, legacy_creds)
+        legacy_before = snapshot(os.path.dirname(legacy_creds))
+        default_env = dict(env, HOME=default_home,
+                           XDG_CACHE_HOME=os.path.join(default_home, ".cache"),
+                           XDG_STATE_HOME=os.path.join(default_home, ".local/state"),
+                           XDG_DATA_HOME=os.path.join(default_home, ".local/share"))
+        default_env.pop("MYMIND_CREDENTIALS")
+        default_env.pop("XDG_CONFIG_HOME")
+        if label == "XDG alternative":
+            default_env["XDG_CONFIG_HOME"] = default_cfg
+        before = snapshot(default_home)
+        p = subprocess.run([public, "check"], capture_output=True, text=True, env=default_env, timeout=15)
+        check(label + " CLI refuses legacy credentials", p.returncode != 0 and
+              problem(p).get("type") == "NotConfigured" and default_creds in problem(p).get("detail", ""))
+        p = subprocess.run([public, "setup", "--yes"], input="", capture_output=True,
+                           text=True, env=default_env, timeout=15)
+        check(label + " installer refuses legacy credentials before edits", p.returncode == 1 and
+              snapshot(default_home) == before)
+        p = terminal_run([public, "setup", "--credentials"], default_env,
+                         (("kid > ", "default-kid"), ("secret > ", SECRET_B64)))
+        saved = json.load(open(default_creds)) if os.path.isfile(default_creds) else {}
+        check(label + " setup writes new default with mode 0600", p.returncode == 0 and
+              saved == {"kid": "default-kid", "secret": SECRET_B64} and
+              os.stat(default_creds).st_mode & 0o777 == 0o600)
+        p = subprocess.run([public, "check"], capture_output=True, text=True, env=default_env, timeout=15)
+        check(label + " check reads new default", p.returncode == 0 and problem(p).get("ok") is True and
+              problem(p).get("credentials") == default_creds)
+        p = subprocess.run([real_py, "-c", mock_probe, os.path.join(ROOT, "test", "mock_api.py"), default_creds],
+                           capture_output=True, text=True, env=default_env, timeout=15)
+        check(label + " mock API reads same default offline", p.returncode == 0)
+        before_creds = snapshot(os.path.dirname(default_creds))
+        p = subprocess.run([public, "setup", "--yes"], input="", capture_output=True,
+                           text=True, env=default_env, timeout=15)
+        check(label + " installer recognizes new default without terminal", p.returncode == 0 and
+              os.path.islink(os.path.join(default_home, ".local", "bin", "omarchy-mymind")) and
+              snapshot(os.path.dirname(default_creds)) == before_creds)
+        p = subprocess.run([public, "setup", "--uninstall", "--yes"], input="yes\n", capture_output=True,
+                           text=True, env=default_env, timeout=15)
+        check(label + " noninteractive uninstall preserves new default", p.returncode == 0 and
+              snapshot(os.path.dirname(default_creds)) == before_creds and "Also delete" not in p.stdout + p.stderr)
+        before = snapshot(default_home)
+        p = terminal_run([public, "setup", "--uninstall"], default_env,
+                         ((f"Also delete the saved access key at {default_creds}? [y/N] ", "yes"),))
+        before.pop(os.path.relpath(default_creds, default_home), None)
+        check(label + " terminal uninstall deletes only new default", p.returncode == 0 and
+              snapshot(default_home) == before)
+        check(label + " legacy credentials never changed", snapshot(os.path.dirname(legacy_creds)) == legacy_before)
 
     # ---------------- 2. symlink safety ----------------
     print("2. omarchy-mymind setup: symlink handling and managed integration")
@@ -571,6 +635,84 @@ with patch("os.execv", side_effect=execv):
     before = snapshot(home)
     p = cli("setup", "--uninstall", "--yes")
     check("repeated uninstall with --yes is harmless", p.returncode == 0 and snapshot(home) == before)
+
+    print("2a. uninstall: explicit terminal consent and exact-path cleanup")
+    cleanup_home = os.path.join(tmp, "cleanup home")
+    cleanup_cfg = os.path.join(cleanup_home, ".config")
+    selected = os.path.join(cleanup_home, "override dir", "saved key.json")
+    cleanup_env = dict(env, HOME=cleanup_home, XDG_CONFIG_HOME=cleanup_cfg,
+                       XDG_CACHE_HOME=os.path.join(cleanup_home, ".cache"),
+                       XDG_STATE_HOME=os.path.join(cleanup_home, ".local/state"),
+                       XDG_DATA_HOME=os.path.join(cleanup_home, ".local/share"), MYMIND_CREDENTIALS=selected)
+    for path in (selected, os.path.join(os.path.dirname(selected), "sibling.json"),
+                 os.path.join(cleanup_cfg, "omarchy-mymind", "credentials.json"),
+                 os.path.join(cleanup_cfg, "mymind", "credentials.json"),
+                 os.path.join(cleanup_env["XDG_CACHE_HOME"], "omarchy-mymind", "thumbnail.png"),
+                 os.path.join(cleanup_env["XDG_STATE_HOME"], "omarchy-mymind", "state.json")):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        shutil.copy2(creds, path)
+    p = subprocess.run([real_py, "-c", mock_probe, os.path.join(ROOT, "test", "mock_api.py"), selected],
+                       capture_output=True, text=True, env=cleanup_env, timeout=15)
+    check("mock API honors credential override with spaces offline", p.returncode == 0)
+    p = subprocess.run([public, "check"], capture_output=True, text=True, env=cleanup_env, timeout=15)
+    check("CLI honors credential override with spaces", p.returncode == 0 and
+          problem(p).get("ok") is True and problem(p).get("credentials") == selected)
+    prompt = f"Also delete the saved access key at {selected}? [y/N] "
+    answers = ("y", "Y", "yes", "YES", "Yes", "", "n", "no", "yEs", "yep")
+    for flags, answer in ([((), answer) for answer in answers] +
+                          [(("--yes",), answer) for answer in ("", "no", "yes")]):
+        shutil.copy2(creds, selected)
+        before = snapshot(cleanup_home)
+        gum_before = open(gum_log).read()
+        p = terminal_run([public, "setup", "--uninstall", *flags], cleanup_env, ((prompt, answer),))
+        remove = answer in ("y", "Y", "yes", "YES", "Yes")
+        if remove:
+            del before[os.path.relpath(selected, cleanup_home)]
+        label = "uninstall " + " ".join(flags) + " answer=" + repr(answer)
+        check(label + " changes only consented credential file", p.returncode == 0 and snapshot(cleanup_home) == before)
+        check(label + " reports outcome and deletion revocation reminder", selected in p.stdout and
+              ("removed" if remove else "kept") in p.stdout.lower() and
+              (not remove or "does not revoke" in p.stdout.lower()))
+        check(label + " uses Bash read even with gum available", "Also delete" not in open(gum_log).read()[len(gum_before):])
+
+    shutil.copy2(creds, selected)
+    before = snapshot(cleanup_home)
+    for terminal in ("neither", "stdin", "stdout"):
+        master, slave = pty.openpty()
+        try:
+            if terminal == "stdin":
+                os.write(master, b"yes\n")
+            p = subprocess.run([public, "setup", "--uninstall", "--yes"],
+                               stdin=slave if terminal == "stdin" else None,
+                               input=None if terminal == "stdin" else "yes\n",
+                               stdout=slave if terminal == "stdout" else subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, env=cleanup_env, timeout=15)
+            check("uninstall --yes tty=" + terminal + " preserves despite yes input", p.returncode == 0 and
+                  snapshot(cleanup_home) == before and "Also delete" not in (p.stdout or "") + p.stderr)
+        finally:
+            os.close(master); os.close(slave)
+
+    os.remove(selected)
+    target = os.path.join(os.path.dirname(selected), "sibling.json")
+    for label, link_target in (("file symlink", target), ("dangling symlink", target + ".missing"),
+                               ("directory symlink", os.path.dirname(creds))):
+        os.symlink(link_target, selected)
+        before = snapshot(cleanup_home)
+        target_before = snapshot(os.path.dirname(creds))
+        p = terminal_run([public, "setup", "--uninstall", "--yes"], cleanup_env, ((prompt, "y"),))
+        del before[os.path.relpath(selected, cleanup_home)]
+        check(label + " unlinks only selected path, never target", p.returncode == 0 and
+              not os.path.lexists(selected) and snapshot(cleanup_home) == before and
+              snapshot(os.path.dirname(creds)) == target_before)
+
+    for label in ("absent file", "accidental directory"):
+        if label == "accidental directory":
+            os.makedirs(selected)
+            shutil.copy2(creds, os.path.join(selected, "keep.json"))
+        before = snapshot(cleanup_home)
+        p = terminal_run([public, "setup", "--uninstall", "--yes"], cleanup_env)
+        check(label + " does not prompt or recursively delete", p.returncode == 0 and
+              "Also delete" not in p.stdout and snapshot(cleanup_home) == before)
 
     # The menu parses the action once, then the terminal wrapper joins $* and
     # parses it again with bash -c. Do not launch a terminal or any desktop UI.

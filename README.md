@@ -26,7 +26,7 @@ Overlay.qml               The overlay UI (all modes)
 BarWidget.qml             Bar icon + IPC handler
 bin/omarchy-mymind         Python 3 (stdlib only) API client: JWT signing, requests, 429 back-off
 libexec/setup             Internal integration installer, called by omarchy-mymind setup
-libexec/credentials       Internal access-key prompt (writes ~/.config/mymind/credentials.json, 0600)
+libexec/credentials       Internal access-key prompt (writes ~/.config/omarchy-mymind/credentials.json, 0600)
 bin/dev-install           Copies the working tree into ~/.config/omarchy/plugins/ and restarts the shell
 test/mock_api.py          Fake API server for UI testing without spending credits
 test/test_security.py     Offline regression tests for the security properties
@@ -74,8 +74,12 @@ every response body is capped (8 MiB JSON/images, 64 KiB errors, 60 s per body).
 
 Create a key at <https://access.mymind.com/extensions> with **Full access**
 (saving needs write); the secret is shown once. `omarchy-mymind setup` stores
-it in `~/.config/mymind/credentials.json` with mode `0600` and
+it in `~/.config/omarchy-mymind/credentials.json` with mode `0600` and
 verifies it with a 1-credit request.
+
+The configuration directory has mode `0700`. `XDG_CONFIG_HOME` overrides the
+default `~/.config` base; `MYMIND_CREDENTIALS` overrides the full credentials
+file path (also supported by the development mock API).
 
 To create or replace just the access key, run `omarchy-mymind setup --credentials`
 in a terminal. This does not change PATH, keybindings, menu entries or plugin
@@ -137,12 +141,20 @@ omarchy-mymind setup --uninstall
 omarchy plugin remove bradenr402.mymind
 ```
 
-The first line removes the CLI symlink, keybindings and menu entries; the
-second removes the plugin. Your access key and caches are left in place so a
-reinstall keeps working. For a clean slate:
+The first line removes the CLI symlink, keybindings and menu entries. In a
+terminal, it also asks whether to delete the saved credentials at the displayed
+path, defaulting to **No**. `--yes` never approves credential deletion; without
+a terminal, credentials are always kept. Only the selected file is removed
+(a symlink is unlinked, not its target); directories, sibling files, caches and
+state are left alone. Deleting the file does not revoke the API key; revoke
+it at <https://access.mymind.com/extensions> if needed.
+
+The second command removes the plugin itself. Omarchy's removal command does
+not run our cleanup or show the credentials prompt, so use the order above.
+For a clean slate, you can additionally remove this plugin's data directories:
 
 ```bash
-rm -rf ~/.config/mymind ~/.cache/omarchy-mymind ~/.local/state/omarchy-mymind
+rm -rf ~/.config/omarchy-mymind ~/.cache/omarchy-mymind ~/.local/state/omarchy-mymind
 ```
 
 ## Development

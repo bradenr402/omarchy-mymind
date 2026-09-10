@@ -2,7 +2,7 @@
 """Tiny fake mymind API for local UI testing. NOT part of the plugin runtime.
 
     python3 test/mock_api.py 8765
-    # then in ~/.config/mymind/credentials.json add "apiUrl": "http://127.0.0.1:8765"
+    # then in ~/.config/omarchy-mymind/credentials.json add "apiUrl": "http://127.0.0.1:8765"
 
 Verifies the HS256 JWT against the secret in the credentials file, echoes
 back plausible objects, and simulates rate-limit headers.
@@ -11,7 +11,10 @@ import base64, hashlib, hmac, json, os, re, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlsplit, parse_qs
 
-CREDS = os.path.expanduser("~/.config/mymind/credentials.json")
+CREDS = os.environ.get("MYMIND_CREDENTIALS", os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "omarchy-mymind", "credentials.json",
+))
 with open(CREDS) as fh:
     C = json.load(fh)
 SECRET = C["secret"].strip().replace("-", "+").replace("_", "/")

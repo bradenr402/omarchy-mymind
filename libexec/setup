@@ -4,7 +4,7 @@
 #   setup              interactive: does everything below, asking before each step
 #   setup --yes        accept integration defaults (credentials still interactive)
 #   setup --uninstall  remove the CLI symlink, keybindings and menu entries this
-#                      script added (credentials are left alone)
+#                      script added; optionally delete credentials after confirmation
 #
 # Steps:
 #   1. Put `omarchy-mymind` on PATH (~/.local/bin symlink)
@@ -26,7 +26,7 @@ CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
 BIN_DIR="$HOME/.local/bin"
 BINDINGS="$CONFIG/hypr/bindings.lua"
 MENU="$CONFIG/omarchy/extensions/omarchy-menu.jsonc"
-CREDS="${MYMIND_CREDENTIALS:-$CONFIG/mymind/credentials.json}"
+CREDS="${MYMIND_CREDENTIALS:-$CONFIG/omarchy-mymind/credentials.json}"
 
 BEGIN="-- BEGIN omarchy-mymind (managed by omarchy-mymind setup)"
 END="-- END omarchy-mymind"
@@ -138,7 +138,24 @@ if $UNINSTALL; then
     strip_block "$MENU" "$JBEGIN" "$JEND"; ok "removed menu entries"
   fi
   echo
-  echo "Left in place: $CREDS, ~/.cache/omarchy-mymind, ~/.local/state/omarchy-mymind"
+  if [[ -f $CREDS || -L $CREDS ]]; then
+    # Destructive consent is separate from --yes and always defaults to keeping.
+    answer=""
+    if [[ -t 0 && -t 1 ]]; then
+      read -r -p "Also delete the saved access key at $CREDS? [y/N] " answer || answer=""
+    fi
+    case $answer in
+      y|Y|yes|YES|Yes)
+        rm -- "$CREDS"
+        ok "removed $CREDS"
+        echo "Deleting the local file does not revoke the API key; revoke it at https://access.mymind.com/extensions if needed."
+        ;;
+      *) skip "kept credentials at $CREDS" ;;
+    esac
+  elif [[ -e $CREDS ]]; then
+    skip "$CREDS is not a credentials file; leaving it alone"
+  fi
+  echo "Left in place: ~/.cache/omarchy-mymind, ~/.local/state/omarchy-mymind, plugin files"
   echo "To remove the plugin itself: omarchy plugin remove $PLUGIN_ID"
   exit 0
 fi
