@@ -29,6 +29,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client
 import io
 import json
 import mimetypes
@@ -74,6 +75,19 @@ BACKOFF_PATH = os.path.join(STATE_DIR, "backoff.json")
 CACHE_DIR = os.path.join(XDG_CACHE, "omarchy-mymind", "thumbnails")
 
 MAX_UPLOAD = 64 * 1024 * 1024
+# Hard caps on anything we read back from the network. A compromised API or
+# CDN must not be able to exhaust memory or fill the cache.
+MAX_JSON_BODY = 8 * 1024 * 1024   # API success bodies (search + object lists)
+MAX_ERROR_BODY = 64 * 1024        # problem+json error bodies
+MAX_IMAGE_BODY = 8 * 1024 * 1024  # a single thumbnail
+MAX_REDIRECTS = 3
+# Wall-clock cap on reading one body. Env override exists for the test suite.
+BODY_DEADLINE = float(os.environ.get("MYMIND_BODY_DEADLINE", "60"))
+# Only these hosts (or their subdomains) may serve thumbnail redirects, over
+# https on port 443. mymind.host is the media CDN the API redirects to. The
+# configured API origin is also accepted. Override for a mock server with
+# MYMIND_THUMBNAIL_HOSTS (comma-separated; a host may be "host:port").
+THUMBNAIL_HOSTS = {"mymind.com", "mymind.host"}
 URL_RE = re.compile(r"^(https?://)[^\s]+$", re.IGNORECASE)
 
 
@@ -218,7 +232,154 @@ class Response:
     def json(self):
         if not self.body:
             return {}
-        return json.loads(self.body.decode("utf-8"))
+        try:
+            return json.loads(self.body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            # Truncated or non-JSON body (e.g. a lying Content-Length).
+            raise MymindError("BadResponse", f"API returned malformed JSON: {exc}", 502) from exc
+
+    def obj(self) -> dict:
+        """Body as a JSON object; a top-level array/scalar is a BadResponse,
+        not an AttributeError on the next .get()."""
+        data = self.json()
+        if not isinstance(data, dict):
+            raise MymindError("BadResponse", f"Expected a JSON object, got {type(data).__name__}.", 502)
+        return data
+
+    def array(self) -> list:
+        data = self.json()
+        if isinstance(data, dict) and not data:
+            return []
+        if not isinstance(data, list):
+            raise MymindError("BadResponse", f"Expected a JSON array, got {type(data).__name__}.", 502)
+        return data
+
+
+def read_bounded(fp, limit: int, headers=None, what: str = "response", deadline: float | None = None) -> bytes:
+    """Read at most `limit` bytes from fp; raise if the body is larger.
+
+    Content-Length is checked first so we can refuse before reading a byte, but
+    it is never trusted: we still stream in chunks and stop at limit+1 so a
+    chunked, lying, or endless body also fails instead of growing unbounded.
+    `deadline` bounds total wall-clock time so a slow-drip server cannot pin
+    the process for hours (socket timeouts are per-read, not per-body).
+    """
+    if headers is not None:
+        cl = headers.get("Content-Length")
+        if cl is not None:
+            try:
+                expected = int(cl)
+            except ValueError:
+                raise MymindError("BadResponse", f"Malformed Content-Length on {what}: {cl!r}", 502)
+            if expected > limit:
+                raise MymindError("ResponseTooLarge", f"{what} is {cl} bytes; limit is {limit}.", 502)
+        else:
+            expected = None
+    else:
+        expected = None
+    buf = bytearray()
+    remaining = limit + 1
+    deadline = BODY_DEADLINE if deadline is None else deadline
+    stop_at = time.monotonic() + deadline
+    # read1() returns whatever one socket read yields instead of blocking until
+    # n bytes arrive, so the deadline is actually checked during a slow drip.
+    read = getattr(fp, "read1", fp.read)
+    while remaining > 0:
+        if time.monotonic() > stop_at:
+            raise MymindError("Network", f"Reading {what} took longer than {int(deadline)}s.")
+        chunk = read(min(65536, remaining))
+        if not chunk:
+            break
+        buf += chunk
+        remaining -= len(chunk)
+    if len(buf) > limit:
+        raise MymindError("ResponseTooLarge", f"{what} exceeds {limit} bytes.", 502)
+    # http.client forces a zero-length body on 204/304 regardless of headers.
+    if getattr(fp, "status", None) in (204, 304):
+        expected = None
+    if expected is not None and len(buf) != expected:
+        # read1() returns EOF instead of raising IncompleteRead; never accept
+        # (or cache) a body shorter than the server announced.
+        raise MymindError("Network", f"{what} truncated: got {len(buf)} of {expected} bytes.")
+    return bytes(buf)
+
+
+def _allowed_thumbnail_hosts() -> set[str]:
+    hosts = set(THUMBNAIL_HOSTS)
+    env = os.environ.get("MYMIND_THUMBNAIL_HOSTS")
+    if env:
+        hosts.update(h.strip().lower() for h in env.split(",") if h.strip())
+    return hosts
+
+
+def validate_download_url(url: str, what: str = "redirect") -> str:
+    """Only accept URLs we expect a thumbnail to live at.
+
+    Accepted:
+      * exactly the configured API origin (scheme + host + port), so a local
+        mock over http://127.0.0.1 keeps working;
+      * https on an allow-listed host or a subdomain of one.
+    Everything else - other schemes, userinfo, loopback/LAN hosts, unknown
+    CDNs - is rejected before any connection is opened.
+    """
+    if not url.isascii() or any(c in url for c in "\r\n\t "):
+        raise MymindError("BadResponse", f"Refusing {what} with non-ASCII or whitespace characters.", 502)
+    try:
+        parts = urllib.parse.urlsplit(url)
+        api = urllib.parse.urlsplit(BASE_URL)
+        port = parts.port  # lazily parsed; non-numeric raises here
+    except ValueError as exc:
+        raise MymindError("BadResponse", f"Unparseable {what} URL.", 502) from exc
+    host = (parts.hostname or "").lower()
+    if parts.username or parts.password or not host:
+        raise MymindError("BadResponse", f"Refusing {what} to {url!r}.", 502)
+    if parts.scheme in ("http", "https") and (parts.scheme, parts.netloc.lower()) == (api.scheme, api.netloc.lower()):
+        return url
+    if parts.scheme != "https":
+        raise MymindError("BadResponse", f"Refusing non-https {what} to {url!r}.", 502)
+    netloc = parts.netloc.lower()
+    for h in _allowed_thumbnail_hosts():
+        if ":" in h:
+            # explicit host:port entry (mock servers): exact match only
+            if netloc == h:
+                return url
+            continue
+        # bare host entry: host or subdomain, default https port only
+        if port in (None, 443) and (host == h or host.endswith("." + h)):
+            return url
+    raise MymindError("BadResponse", f"Refusing {what} to unexpected host {parts.netloc!r}.", 502)
+
+
+def download_bounded(url: str, limit: int, timeout: float = 30.0) -> bytes:
+    """GET `url` following at most MAX_REDIRECTS, validating every hop, and
+    reading at most `limit` bytes. Redirects are handled by hand so that no
+    hop can escape the allow-list."""
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    for _ in range(MAX_REDIRECTS + 1):
+        validate_download_url(url)
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "image/*"})
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                return read_bounded(r, limit, r.headers, "thumbnail")
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                loc = exc.headers.get("Location")
+                if not loc:
+                    raise MymindError("BadResponse", "Redirect without Location header.", 502) from exc
+                url = urllib.parse.urljoin(url, loc)
+                continue
+            raise MymindError("Network", f"Thumbnail download failed: HTTP {exc.code}", exc.code) from exc
+        except urllib.error.URLError as exc:
+            raise MymindError("Network", f"Thumbnail download failed: {exc.reason}") from exc
+        except (TimeoutError, http.client.HTTPException, ConnectionError, UnicodeError) as exc:
+            # IncompleteRead / RemoteDisconnected / InvalidURL / truncated bodies
+            raise MymindError("Network", f"Thumbnail download failed: {exc}") from exc
+    raise MymindError("BadResponse", "Too many redirects fetching thumbnail.", 502)
 
 
 def request(
@@ -230,9 +391,13 @@ def request(
     raw_body: bytes | None = None,
     content_type: str | None = None,
     accept: str = "application/json",
-    follow_redirects: bool = True,
+    max_body: int = MAX_JSON_BODY,
     timeout: float = 30.0,
 ) -> Response:
+    """Signed request to the API. Never follows redirects: 3xx is returned as a
+    Response so the caller can decide (only the thumbnail path ever does, and
+    it validates the destination). Bodies are capped at `max_body`; error
+    bodies at MAX_ERROR_BODY."""
     check_backoff()
     kid, secret = load_credentials()
 
@@ -263,33 +428,43 @@ def request(
         def redirect_request(self, *a, **k):  # noqa: D401
             return None
 
-    opener = urllib.request.build_opener() if follow_redirects else urllib.request.build_opener(_NoRedirect)
+    opener = urllib.request.build_opener(_NoRedirect)
 
+    err: urllib.error.HTTPError | None = None
     try:
         with opener.open(req, timeout=timeout) as resp:
-            return Response(resp.status, resp.headers, resp.read())
+            return Response(resp.status, resp.headers, read_bounded(resp, max_body, resp.headers, "API response"))
     except urllib.error.HTTPError as exc:
-        body = exc.read()
         if exc.code in (301, 302, 303, 307, 308):
-            return Response(exc.code, exc.headers, body)
-        if exc.code == 429:
-            wait = record_backoff(exc.headers)
-            raise MymindError(
-                "RateLimited", f"Rate limited; try again in {wait}s.", 429, {"retryAfter": wait}
-            ) from exc
-        try:
-            problem = json.loads(body.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            problem = {}
-        raise MymindError(
-            problem.get("type") or f"Http{exc.code}",
-            problem.get("detail") or exc.reason or f"HTTP {exc.code}",
-            exc.code,
-        ) from exc
+            # Don't read a redirect body at all; the caller only wants Location.
+            return Response(exc.code, exc.headers, b"")
+        err = exc  # body read below, so the sibling handlers still apply
     except urllib.error.URLError as exc:
         raise MymindError("Network", f"Network error: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise MymindError("Network", "Request timed out.") from exc
+    except (TimeoutError, http.client.HTTPException, ConnectionError, UnicodeError) as exc:
+        # IncompleteRead / RemoteDisconnected / truncated or lying bodies
+        raise MymindError("Network", f"Network error: {exc}") from exc
+
+    if err.code == 429:
+        # Record the back-off before touching the body so a hostile/oversized
+        # 429 body can't prevent it.
+        wait = record_backoff(err.headers)
+        raise MymindError("RateLimited", f"Rate limited; try again in {wait}s.", 429, {"retryAfter": wait}) from err
+    try:
+        body = read_bounded(err, MAX_ERROR_BODY, err.headers, "API error response")
+    except (TimeoutError, http.client.HTTPException, ConnectionError, UnicodeError) as exc:
+        raise MymindError("Network", f"Network error: {exc}") from exc
+    try:
+        problem = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        problem = {}
+    if not isinstance(problem, dict):
+        problem = {}
+    raise MymindError(
+        str(problem.get("type") or f"Http{err.code}"),
+        str(problem.get("detail") or err.reason or f"HTTP {err.code}"),
+        err.code,
+    ) from err
 
 
 def request_multipart(path: str, metadata: dict, blob: bytes, filename: str, mime: str) -> Response:
@@ -357,7 +532,7 @@ def _build_meta(args, **extra) -> dict:
 
 
 def _save_result(resp: Response, kind: str, extra: dict | None = None) -> dict:
-    obj = resp.json()
+    obj = resp.obj()
     out = {
         "ok": True,
         "kind": kind,
@@ -365,7 +540,7 @@ def _save_result(resp: Response, kind: str, extra: dict | None = None) -> dict:
         "bumped": resp.status == 200,  # 200 => duplicate bumped, 201 => created
         "id": obj.get("id"),
         "title": obj.get("title"),
-        "url": (obj.get("source") or {}).get("url") or obj.get("url"),
+        "url": _d(obj.get("source")).get("url") or obj.get("url"),
         "appUrl": app_url(obj.get("id")),
         "cost": _int_header(resp.headers, "RateLimit-Cost"),
     }
@@ -387,31 +562,40 @@ def app_url(object_id: str | None) -> str | None:
     return f"{APP_URL}/everything#{object_id}" if object_id else None
 
 
+def _d(v) -> dict:
+    """Coerce an API sub-object to a dict (the API is untrusted input)."""
+    return v if isinstance(v, dict) else {}
+
+
 def summarize_object(obj: dict) -> dict:
-    """Trim an object to what the overlay needs."""
-    source = obj.get("source") or {}
+    """Trim an object to what the overlay needs. Tolerates wrong shapes."""
+    source = _d(obj.get("source"))
     url = source.get("url") or obj.get("url")
+    url = url if isinstance(url, str) else None
     domain = ""
     if url:
         try:
             domain = urllib.parse.urlsplit(url).netloc.removeprefix("www.")
         except ValueError:
             domain = ""
-    content = obj.get("content") or {}
+    content = _d(obj.get("content"))
     body = content.get("body") if isinstance(content.get("body"), str) else ""
-    snippet = (obj.get("summary") or body or "").strip().replace("\n", " ")
+    summary = obj.get("summary") if isinstance(obj.get("summary"), str) else ""
+    snippet = (summary or body or "").strip().replace("\n", " ")
     if len(snippet) > 220:
         snippet = snippet[:217].rstrip() + "…"
-    blob = obj.get("blob") or {}
+    blob = _d(obj.get("blob"))
+    tags = obj.get("tags") if isinstance(obj.get("tags"), list) else []
+    oid = obj.get("id") if isinstance(obj.get("id"), str) else None
     return {
-        "id": obj.get("id"),
-        "title": obj.get("title") or (domain or "Untitled"),
+        "id": oid,
+        "title": obj.get("title") if isinstance(obj.get("title"), str) and obj.get("title") else (domain or "Untitled"),
         "url": url,
         "domain": domain,
-        "appUrl": app_url(obj.get("id")),
+        "appUrl": app_url(oid),
         "snippet": snippet,
-        "tags": [t.get("name") for t in (obj.get("tags") or []) if t.get("name")],
-        "type": (obj.get("mainEntity") or {}).get("@type") or ("image" if str(blob.get("type", "")).startswith("image/") else ("note" if body and not url else "")),
+        "tags": [t.get("name") for t in tags if isinstance(t, dict) and t.get("name")],
+        "type": _d(obj.get("mainEntity")).get("@type") or ("image" if str(blob.get("type", "")).startswith("image/") else ("note" if body and not url else "")),
         "hasThumbnail": bool(blob or obj.get("screenshot")),
         "created": obj.get("created"),
         "bumped": obj.get("bumped"),
@@ -438,19 +622,23 @@ def cmd_search(args) -> dict:
     if args.semantic:
         query["semantic"] = "true"
     resp = request("GET", "/search", query=query)
-    matches = resp.json().get("matches") or []
+    matches = resp.obj().get("matches") or []
+    if not isinstance(matches, list):
+        raise MymindError("BadResponse", "Search matches is not an array.", 502)
     cost = _int_header(resp.headers, "RateLimit-Cost") or 0
     ids = [m["id"] for m in matches if m.get("id")]
     results: list[dict] = []
     if ids:
         objs_resp = request("GET", "/objects", query=[("id", i) for i in ids])
         cost += _int_header(objs_resp.headers, "RateLimit-Cost") or 0
-        by_id = {o.get("id"): o for o in objs_resp.json() if isinstance(o, dict)}
+        by_id = {o.get("id"): o for o in objs_resp.array() if isinstance(o, dict)}
         for m in matches:
-            o = by_id.get(m.get("id"))
+            o = by_id.get(m.get("id")) if isinstance(m, dict) else None
             if not o:
                 continue
             s = summarize_object(o)
+            if not s["id"]:
+                continue
             s["score"] = m.get("score")
             results.append(s)
     return {"ok": True, "query": q, "semantic": bool(args.semantic), "results": results, "cost": cost}
@@ -458,7 +646,8 @@ def cmd_search(args) -> dict:
 
 def cmd_get(args) -> dict:
     resp = request("GET", f"/objects/{args.id}")
-    return {"ok": True, "object": summarize_object(resp.json()), "raw": resp.json() if args.raw else None}
+    obj = resp.obj()
+    return {"ok": True, "object": summarize_object(obj), "raw": obj if args.raw else None}
 
 
 def cmd_save_url(args) -> dict:
@@ -560,7 +749,7 @@ def cmd_spaces(args) -> dict:
     resp = request("GET", "/spaces")
     spaces = [
         {"id": s.get("id"), "name": s.get("name"), "color": s.get("color")}
-        for s in resp.json()
+        for s in resp.array()
         if isinstance(s, dict)
     ]
     spaces.sort(key=lambda s: (s["name"] or "").lower())
@@ -582,7 +771,7 @@ def cmd_add_note(args) -> dict:
     resp = request(
         "POST", f"/objects/{args.id}/notes", raw_body=body.encode("utf-8"), content_type="text/markdown"
     )
-    return {"ok": True, "id": args.id, "noteId": resp.json().get("id")}
+    return {"ok": True, "id": args.id, "noteId": resp.obj().get("id")}
 
 
 def cmd_add_to_space(args) -> dict:
@@ -601,21 +790,21 @@ def cmd_thumbnail(args) -> dict:
         f"/objects/{args.id}/thumbnail",
         query={"size": args.size} if args.size else None,
         accept="image/*",
-        follow_redirects=False,
+        max_body=MAX_IMAGE_BODY,
     )
     data = resp.body
     if resp.status in (301, 302, 303, 307, 308):
         location = resp.headers.get("Location")
         if not location:
-            raise MymindError("BadResponse", "Redirect without Location header.")
-        req = urllib.request.Request(location, headers={"User-Agent": USER_AGENT})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = r.read()
-        except urllib.error.URLError as exc:
-            raise MymindError("Network", f"Thumbnail download failed: {exc.reason}") from exc
+            raise MymindError("BadResponse", "Redirect without Location header.", 502)
+        # The API hands us a CDN URL. It is untrusted input: must be https on an
+        # expected host (every hop), and capped in size while streaming.
+        location = urllib.parse.urljoin(BASE_URL, location)
+        data = download_bounded(location, MAX_IMAGE_BODY)
     if not data:
         raise MymindError("NotFound", "No thumbnail bytes returned.", 404)
+    if len(data) > MAX_IMAGE_BODY:
+        raise MymindError("ResponseTooLarge", "Thumbnail exceeds the size limit.", 502)
     tmp = cache_path + ".tmp"
     with open(tmp, "wb") as fh:
         fh.write(data)
@@ -628,8 +817,10 @@ def cmd_open(args) -> dict:
     target = None
     if not args.app:
         resp = request("GET", f"/objects/{args.id}")
-        obj = resp.json()
-        target = (obj.get("source") or {}).get("url") or obj.get("url")
+        obj = resp.obj()
+        target = _d(obj.get("source")).get("url") or obj.get("url")
+        if target is not None and (not isinstance(target, str) or not URL_RE.match(target)):
+            raise MymindError("BadResponse", "Object source URL is not an http(s) URL; not opening it.", 502)
     target = target or app_url(args.id)
     opener = "xdg-open"
     if shutil.which("omarchy-launch-browser"):
@@ -746,6 +937,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:  # noqa: BLE001 - stdout must always be one JSON document
+        problem = {"ok": False, "type": "Internal", "status": 0, "detail": f"{type(exc).__name__}: {exc}"}
+        print(json.dumps(problem))
+        print(f"mymind: Internal: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
