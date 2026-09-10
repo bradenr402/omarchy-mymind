@@ -29,6 +29,7 @@ bin/setup          One-shot setup: PATH symlinks, access key, keybindings, menu 
 bin/mymind-setup   Access-key prompt only (writes ~/.config/mymind/credentials.json, 0600)
 bin/dev-install    Copies the working tree into ~/.config/omarchy/plugins/ and restarts the shell
 test/mock_api.py   Fake API server for UI testing without spending credits
+test/test_security.py  Offline regression tests for the security properties
 ```
 
 The QML never touches the network itself; it shells out to `bin/mymind`, which
@@ -54,11 +55,16 @@ omarchy plugin add https://github.com/bradenr402/omarchy-mymind.git --enable
 
 Config edits live between `omarchy-mymind` marker comments; re-running `setup`
 refreshes them and `setup --uninstall` removes them. `setup --yes` skips the
-prompts. Nothing outside the markers is touched, and no step needs sudo.
+prompts. Nothing outside the markers is touched, and no step needs sudo. The
+`~/.local/bin` symlinks are only created if the name is free, and only removed
+if they still point at this plugin's files; anything else there is left alone.
 
 Requirements: Omarchy 4 (Quattro), `python3` (stdlib only), `wl-clipboard`,
 and `gum` for the interactive prompts. The plugin talks only to
-`api.mymind.com`, using an access key you supply.
+`api.mymind.com`, using an access key you supply. Thumbnail redirects are
+followed only to `https://*.mymind.com` / `https://*.mymind.host` (its media
+CDN) on port 443, or back to the configured API origin, at most 3 hops, and
+every response body is capped (8 MiB JSON/images, 64 KiB errors, 60 s per body).
 
 ### Access key
 
@@ -68,7 +74,9 @@ its own) stores it in `~/.config/mymind/credentials.json` with mode `0600` and
 verifies it with a 1-credit request.
 
 The secret never leaves the machine; it is only used to HMAC-sign short-lived
-JWTs bound to each request's method and path.
+JWTs bound to each request's method and path. It is passed to the writer over
+stdin, never as a command-line argument, so it does not appear in
+`/proc/*/cmdline`. Note bodies from the overlay take the same stdin path.
 
 Prefer different keys or menu placement? Run `setup`, decline steps 3–4, and
 copy what you want from `bin/setup` (`bindings_block` / `menu_block`).
@@ -141,7 +149,13 @@ journalctl --user -f -o cat | grep -i mymind
 
 To exercise the UI without spending credits, run `python3 test/mock_api.py`
 and add `"apiUrl": "http://127.0.0.1:8765"` to your credentials file (any
-kid/secret pair works with the mock). Remove it afterwards.
+kid/secret pair works with the mock). Remove it afterwards. If a mock serves
+thumbnails from a different origin, allow it with
+`MYMIND_THUMBNAIL_HOSTS=host:port`.
+
+`python3 test/test_security.py` runs the offline regression suite for the
+security properties above (secret handling, symlink safety, bounded network
+reads, redirect validation) against throwaway HOME/XDG dirs.
 
 ## Notes / limitations
 
