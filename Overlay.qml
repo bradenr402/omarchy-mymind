@@ -228,7 +228,10 @@ Item {
     if (!body.trim()) { root.setStatus("Nothing to save", true); return }
     root.busy = true
     root.busyLabel = "Saving note…"
-    saveProc.command = [root.cli, "save-note", body]
+    // Note bodies go over stdin, never argv: argv is world-readable in
+    // /proc/<pid>/cmdline for the lifetime of the process.
+    saveProc.stdinPayload = body
+    saveProc.command = [root.cli, "save-note"]
     saveProc.running = true
   }
 
@@ -260,9 +263,9 @@ Item {
     var id = root.saved.id
     var actions = []
     var tags = tagsField.text.split(",").map(function(t) { return t.trim() }).filter(function(t) { return t.length > 0 })
-    if (tags.length) actions.push([root.cli, "add-tags", id].concat(tags))
-    if (followupNote.text.trim()) actions.push([root.cli, "add-note", id, followupNote.text])
-    if (spaceDropdown.value) actions.push([root.cli, "add-to-space", id, spaceDropdown.value])
+    if (tags.length) actions.push({argv: [root.cli, "add-tags", id].concat(tags)})
+    if (followupNote.text.trim()) actions.push({argv: [root.cli, "add-note", id], stdin: followupNote.text})
+    if (spaceDropdown.value) actions.push({argv: [root.cli, "add-to-space", id, spaceDropdown.value]})
     if (!actions.length) { root.dismiss(); return }
     root.pendingActions = actions
     root.busy = true
@@ -279,9 +282,10 @@ Item {
       root.dismiss()
       return
     }
-    var argv = root.pendingActions[0]
+    var action = root.pendingActions[0]
     root.pendingActions = root.pendingActions.slice(1)
-    actionProc.command = argv
+    actionProc.stdinPayload = action.stdin || ""
+    actionProc.command = action.argv
     actionProc.running = true
   }
 
@@ -348,6 +352,7 @@ Item {
           return
         }
         root.busyLabel = "Saving " + (res.kind === "url" ? "link" : res.kind) + "…"
+        saveProc.stdinPayload = ""
         saveProc.command = [root.cli, "save-clipboard"]
         saveProc.running = true
       }
@@ -356,6 +361,16 @@ Item {
 
   Process {
     id: saveProc
+    // Set before running=true; written to the child's stdin once it starts,
+    // then stdin is closed so the CLI sees EOF. Empty => stdin stays closed.
+    property string stdinPayload: ""
+    stdinEnabled: stdinPayload.length > 0
+    onStarted: {
+      if (stdinPayload.length > 0) {
+        write(stdinPayload)
+        stdinPayload = ""   // drops the reference and closes stdin via the binding
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applySaveResult(root.parseJson(text))
@@ -381,6 +396,14 @@ Item {
 
   Process {
     id: actionProc
+    property string stdinPayload: ""
+    stdinEnabled: stdinPayload.length > 0
+    onStarted: {
+      if (stdinPayload.length > 0) {
+        write(stdinPayload)
+        stdinPayload = ""
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
