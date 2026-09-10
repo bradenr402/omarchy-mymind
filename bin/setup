@@ -105,6 +105,13 @@ PY
 
 has_block() { [[ -f $1 ]] && grep -qF -- "$2" "$1"; }
 
+# True if $1 is a symlink whose literal (readlink, not readlink -f) target is
+# exactly this plugin's $2. Anything else - a regular file, a foreign link, a
+# relative link, a dangling link - is "not ours" and must be left alone.
+ours() { # link name
+  [[ -L $1 && $(readlink -- "$1") == "$HERE/$2" ]]
+}
+
 # --------------------------------------------------------------------------- #
 # Uninstall
 # --------------------------------------------------------------------------- #
@@ -112,7 +119,11 @@ has_block() { [[ -f $1 ]] && grep -qF -- "$2" "$1"; }
 if $UNINSTALL; then
   info "Removing omarchy-mymind integration"
   for b in mymind mymind-setup; do
-    if [[ -L $BIN_DIR/$b ]]; then rm "$BIN_DIR/$b"; ok "removed $BIN_DIR/$b"; fi
+    if ours "$BIN_DIR/$b" "$b"; then
+      rm -- "$BIN_DIR/$b"; ok "removed $BIN_DIR/$b"
+    elif [[ -e $BIN_DIR/$b || -L $BIN_DIR/$b ]]; then
+      skip "$BIN_DIR/$b is not this plugin's symlink; leaving it alone"
+    fi
   done
   if has_block "$BINDINGS" "$BEGIN"; then strip_block "$BINDINGS" "$BEGIN" "$END"; ok "removed keybindings"; hyprctl reload >/dev/null 2>&1 || true; fi
   if has_block "$MENU" "$JBEGIN"; then
@@ -138,12 +149,15 @@ info "1/5 Command-line tools"
 mkdir -p "$BIN_DIR"
 for b in mymind mymind-setup; do
   target="$BIN_DIR/$b"
-  if [[ -L $target && $(readlink -f "$target") == "$(readlink -f "$HERE/$b")" ]]; then
+  if ours "$target" "$b"; then
     skip "$target already linked"
-  elif [[ -e $target && ! -L $target ]]; then
-    skip "$target exists and is not a symlink; leaving it alone"
+  elif [[ -e $target || -L $target ]]; then
+    # Regular file, foreign/relative symlink, or dangling symlink: refuse to
+    # replace it. Only a nonexistent path gets a new link.
+    skip "$target already exists and is not this plugin's symlink; leaving it alone"
+    echo "    remove it yourself if you want \`$b\` on PATH, or call $HERE/$b directly"
   else
-    ln -sfn "$HERE/$b" "$target"; ok "linked $target"
+    ln -s -- "$HERE/$b" "$target"; ok "linked $target"
   fi
 done
 case ":$PATH:" in
