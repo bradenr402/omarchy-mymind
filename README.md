@@ -24,7 +24,7 @@ Plugin id: `bradenr402.mymind`
 manifest.json             Omarchy plugin manifest (overlay + bar-widget)
 Overlay.qml               The overlay UI (all modes)
 BarWidget.qml             Bar icon + IPC handler
-bin/omarchy-mymind         Python 3 (stdlib only) API client: JWT signing, requests, 429 back-off
+bin/omarchy-mymind        Python 3 (stdlib only) API client: JWT signing, requests, 429 back-off
 libexec/setup             Internal integration installer, called by omarchy-mymind setup
 libexec/credentials       Internal access-key prompt (writes ~/.config/omarchy-mymind/credentials.json, 0600)
 bin/dev-install           Copies the working tree into ~/.config/omarchy/plugins/ and restarts the shell
@@ -70,7 +70,7 @@ followed only to `https://*.mymind.com` / `https://*.mymind.host` (its media
 CDN) on port 443, or back to the configured API origin, at most 3 hops, and
 every response body is capped (8 MiB JSON/images, 64 KiB errors, 60 s per body).
 
-### Access key
+### Access Key
 
 Create a key at <https://access.mymind.com/extensions> with **Full access**
 (saving needs write); the secret is shown once. `omarchy-mymind setup` stores
@@ -93,7 +93,7 @@ stdin, never as a command-line argument, so it does not appear in
 Prefer different keys or menu placement? Run `omarchy-mymind setup`, decline
 steps 3–4, and copy what you want from `libexec/setup` (`bindings_block` / `menu_block`).
 
-## Summon payloads
+## Summon Payloads
 
 `omarchy-shell shell summon bradenr402.mymind '<json>'`
 
@@ -167,10 +167,10 @@ bin/dev-install
 ```
 
 ```bash
-bin/dev-install            # sync + restart shell (QML is cached; a restart is required for QML edits)
+bin/dev-install                # sync + restart shell (QML is cached; a restart is required for QML edits)
 NO_RESTART=1 bin/dev-install   # sync only (enough for bin/ changes)
-bin/dev-install --watch    # resync on every save
-omarchy plugin validate .  # manifest/structure check
+bin/dev-install --watch        # resync on every save
+omarchy plugin validate .      # manifest/structure check
 journalctl --user -f -o cat | grep -i mymind
 ```
 
@@ -184,7 +184,7 @@ thumbnails from a different origin, allow it with
 security properties above (secret handling, symlink safety, bounded network
 reads, redirect validation) against throwaway HOME/XDG dirs.
 
-## Notes / limitations
+## Notes / Limitations
 
 - mymind's API content scope is not yet enforced; any key can see everything.
 - Search costs 10–250 credits per query plus 1–250 for fetching the matching
@@ -195,4 +195,4 @@ reads, redirect validation) against throwaway HOME/XDG dirs.
 
 ## License
 
-MIT
+[MIT](LICENSE)
