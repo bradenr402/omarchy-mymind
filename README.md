@@ -1,5 +1,7 @@
 # omarchy-mymind
 
+[![Built for Omarchy: Plugin](https://raw.githubusercontent.com/tcballard/omarchy-badges/75975e5b5bf75e7ede3764bcd2950046f7abfe2c/badges/v1/omarchy-plugin.svg)](https://github.com/tcballard/omarchy-badges)
+
 An [Omarchy](https://omarchy.org) shell plugin for [mymind](https://mymind.com).
 Search your mind from a keyboard-first overlay, and save links, notes and
 clipboard contents to it without leaving your desktop.
